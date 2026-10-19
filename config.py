@@ -63,7 +63,18 @@ ALPACA_DATA_FEED = _env_str("ALPACA_DATA_FEED", "iex")  # iex | sip
 # ---------------------------------------------------------------------------
 # Watchlist
 # ---------------------------------------------------------------------------
-_DEFAULT_WATCHLIST = ["AAPL", "NVDA", "TSLA", "MSFT", "AMZN", "META", "GOOGL"]
+_DEFAULT_WATCHLIST = [
+    "AAPL",
+    "NVDA",
+    "TSLA",
+    "MSFT",
+    "AMZN",
+    "META",
+    "GOOGL",
+    "NFLX",
+    "AMD",
+    "QQQ",
+]
 WATCHLIST = _env_list("WATCHLIST", _DEFAULT_WATCHLIST)
 
 # ---------------------------------------------------------------------------
