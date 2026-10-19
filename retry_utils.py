@@ -24,13 +24,13 @@ logger = logging.getLogger(__name__)
 
 # --- Optional Alpaca imports (kept soft so the module stays importable) -----
 try:  # pragma: no cover - depends on install
-    from alpaca.common.exceptions import APIError, RetryException
+    from alpaca.common.exceptions import APIError, RetryException # pyright: ignore[reportMissingImports]
 except Exception:  # pragma: no cover
     APIError = None  # type: ignore
     RetryException = None  # type: ignore
 
 try:  # pragma: no cover
-    import requests
+    import requests # pyright: ignore[reportMissingModuleSource]
 
     _REQUESTS_ERRORS: Tuple[Type[BaseException], ...] = (
         requests.exceptions.ConnectionError,

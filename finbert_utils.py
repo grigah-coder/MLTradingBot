@@ -19,8 +19,8 @@ import logging
 import threading
 from typing import Dict, List, Optional, Sequence, Tuple
 
-import torch
-from transformers import AutoModelForSequenceClassification, AutoTokenizer
+import torch # pyright: ignore[reportMissingImports]
+from transformers import AutoModelForSequenceClassification, AutoTokenizer # pyright: ignore[reportMissingImports]
 
 from cache_utils import TTLCache
 

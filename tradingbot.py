@@ -23,14 +23,14 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
-import numpy as np
-import pandas as pd
-import requests
-from alpaca.data.historical.news import NewsClient
-from alpaca.data.requests import NewsRequest
-from lumibot.brokers import Alpaca
-from lumibot.strategies.strategy import Strategy
-from lumibot.traders import Trader
+import numpy as np # pyright: ignore[reportMissingImports]
+import pandas as pd # pyright: ignore[reportMissingModuleSource]
+import requests # pyright: ignore[reportMissingModuleSource]
+from alpaca.data.historical.news import NewsClient # pyright: ignore[reportMissingImports]
+from alpaca.data.requests import NewsRequest # pyright: ignore[reportMissingImports]
+from lumibot.brokers import Alpaca # pyright: ignore[reportMissingImports]
+from lumibot.strategies.strategy import Strategy # pyright: ignore[reportMissingImports]
+from lumibot.traders import Trader # pyright: ignore[reportMissingImports]
 
 from cache_utils import TTLCache
 from finbert_utils import estimate_sentiment, warm_up as finbert_warm_up
@@ -610,7 +610,7 @@ def main():
         raise SystemExit(2)
 
     if IS_BACKTESTING:
-        from lumibot.backtesting import YahooDataBacktesting
+        from lumibot.backtesting import YahooDataBacktesting # pyright: ignore[reportMissingImports]
 
         start = datetime.fromisoformat(BACKTEST_START)
         end = datetime.fromisoformat(BACKTEST_END)
