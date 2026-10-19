@@ -164,6 +164,7 @@ def alpaca_config():
         "API_KEY": ALPACA_API_KEY,
         "API_SECRET": ALPACA_API_SECRET,
         "is_paper": ALPACA_PAPER,
+        "FEED": ALPACA_DATA_FEED,
     }
 
 

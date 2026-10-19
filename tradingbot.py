@@ -32,6 +32,7 @@ from lumibot.brokers import Alpaca # pyright: ignore[reportMissingImports]
 from lumibot.strategies.strategy import Strategy # pyright: ignore[reportMissingImports]
 from lumibot.traders import Trader # pyright: ignore[reportMissingImports]
 
+from alpaca_data_source import AlpacaIEXData
 from cache_utils import TTLCache
 from finbert_utils import estimate_sentiment, warm_up as finbert_warm_up
 from logging_setup import configure_logging
@@ -619,7 +620,11 @@ def main():
         return
 
     logger.info("Starting LIVE/PAPER trading (paper=%s)", alpaca_config()["is_paper"])
-    broker = Alpaca(alpaca_config())
+    config = alpaca_config()
+    # Pin every historical/latest stock request to the configured feed (IEX by
+    # default); lumibot's built-in AlpacaData would otherwise default to SIP.
+    data_source = AlpacaIEXData(config)
+    broker = Alpaca(config, data_source=data_source)
     trader = Trader()
     strategy = MLTraderProMax(broker=broker)
     trader.add_strategy(strategy)
