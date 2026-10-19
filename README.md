@@ -9,8 +9,8 @@ An asynchronous, production-ready automated algorithmic trading bot built in Pyt
 - **Sentiment Analysis:** Evaluates recent financial headlines via Hugging Face's **FinBERT** transformer model.
 - **TTL Caching:** Built-in in-memory caching for news, sentiment scores, and technical indicators to minimize redundant API calls and processing overhead.
 - **Resilient Error Handling:** Robust exponential backoff with jitter for network failures and Alpaca rate limits.
-- **Automated Alerts:** Dispatches instant status updates (fills, rejections, buy/sell actions) directly to **Telegram**.
-- **End-of-Day Report:** When the market closes, logs and sends a daily summary with the account balance, open positions and today's filled orders.
+- **Automated Alerts:** Dispatches instant status updates (fills, cancellations, buy/sell actions) directly to **Telegram** in clear **Darija/Arabic**.
+- **End-of-Day Report:** When the market closes, logs and sends an Arabic daily summary with daily profit/loss ($ and %), winning vs losing trades, the portfolio balance and open positions.
 - **Risk Management:** Features built-in Stop Loss, Take Profit, and bracket order fallback mechanics.
 
 ---
@@ -21,6 +21,7 @@ MLTradingBot/
 │
 ├── tradingbot.py         # Main entry point and strategy loop
 ├── config.py             # Centralised environment and strategy configuration
+├── trade_ledger.py       # Persistent FIFO ledger for daily win/loss reporting
 ├── finbert_utils.py      # FinBERT NLP sentiment pipeline and batch inference
 ├── cache_utils.py        # Thread-safe in-memory TTL cache implementation
 ├── logging_setup.py      # Size-bounded rotating file and console logger
@@ -61,6 +62,7 @@ MLTradingBot/
    # Optional: end-of-day report controls
    DAILY_SUMMARY_ENABLED=True
    MARKET_TIMEZONE=America/New_York
+   TRADE_LEDGER_FILE=logs/trade_ledger.json
    ```
 
 ---

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import atexit
 import hashlib
+import html
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -47,6 +48,7 @@ from cache_utils import TTLCache
 from finbert_utils import estimate_sentiment, warm_up as finbert_warm_up
 from logging_setup import configure_logging
 from retry_utils import call_with_retry
+from trade_ledger import DailyTradeLedger
 from config import (
     WATCHLIST,
     NEWS_CACHE_TTL,
@@ -74,6 +76,7 @@ from config import (
     TELEGRAM_RETRY_ATTEMPTS,
     DAILY_SUMMARY_ENABLED,
     MARKET_TIMEZONE,
+    TRADE_LEDGER_FILE,
     RETRY_ATTEMPTS,
     RETRY_BASE_DELAY,
     RETRY_MAX_DELAY,
@@ -312,7 +315,26 @@ def _signed_money(value):
 
 
 def _truncate(text, limit):
-    return text if len(text) <= limit else text[: max(0, limit - 3)] + "..."
+    """Truncate on a line boundary.
+
+    Telegram messages use HTML markup, so cutting mid-tag would make the whole
+    message invalid. Keeping complete lines guarantees balanced tags.
+    """
+    text = str(text)
+    if len(text) <= limit:
+        return text
+    suffix = "\n…"
+    kept = []
+    used = 0
+    for line in text.splitlines():
+        if used + len(line) + 1 + len(suffix) > limit:
+            break
+        kept.append(line)
+        used += len(line) + 1
+    if not kept:
+        # A single oversized line: best effort, without exceeding the limit.
+        return text[: max(0, limit - len(suffix))] + suffix
+    return "\n".join(kept) + suffix
 
 
 def _account_snapshot(api):
@@ -379,6 +401,7 @@ def _filled_orders_snapshot(api, since):
             continue
         fills.append(
             {
+                "id": getattr(order, "id", None),
                 "symbol": getattr(order, "symbol", "?"),
                 "side": _enum_value(getattr(order, "side", "")).lower(),
                 "qty": filled_qty,
@@ -396,37 +419,48 @@ def format_daily_summary(
     positions,
     fills,
     *,
+    trade_stats=None,
     max_positions=20,
     max_fills=20,
     compact=False,
 ):
     """Render the end-of-day report as text.
 
-    ``compact=True`` produces the shorter, emoji-rich variant sent to
-    Telegram; the default is the verbose form written to the log.
+    ``compact=True`` produces the Arabic/Darija variant sent to Telegram; the
+    default is the verbose English form written to the log. When
+    ``trade_stats`` is supplied it adds the day's winning/losing trade counts
+    and the realised P/L from :class:`trade_ledger.DailyTradeLedger`.
     """
     lines = []
     if compact:
-        lines.append(f"📊 Daily summary — {date_str}")
+        lines.append(f"📊 <b>ملخص نهاية اليوم — {_esc(date_str)}</b>")
     else:
         lines.append(f"End-of-day summary for {date_str}")
 
     # --- Account balance ---------------------------------------------
     if account is None:
-        lines.append("Account: balance unavailable (Alpaca account fetch failed)")
+        if compact:
+            lines.append("⚠️ الحساب: ما قدرناش نجيبو الرصيد من Alpaca")
+        else:
+            lines.append("Account: balance unavailable (Alpaca account fetch failed)")
     elif compact:
+        lines.append(f"💰 <b>رصيد المحفظة:</b> {_money(account['equity'])}")
         lines.append(
-            f"💰 Account value: {_money(account['equity'])} | "
-            f"Cash: {_money(account['cash'])} | "
-            f"Available to trade: {_money(account['buying_power'])}"
+            f"• الكاش المتوفر: {_money(account['cash'])} | "
+            f"القوة الشرائية: {_money(account['buying_power'])}"
         )
         if account.get("day_pl") is not None:
             pct = account.get("day_pl_pct")
             pct_txt = f" ({pct:+.2f}%)" if pct is not None else ""
             arrow = "📈" if account["day_pl"] >= 0 else "📉"
             lines.append(
-                f"{arrow} Today's profit/loss: "
+                f"{arrow} <b>الربح/الخسارة ديال اليوم:</b> "
                 f"{_signed_money(account['day_pl'])}{pct_txt}"
+            )
+        elif trade_stats and trade_stats.get("trade_count"):
+            lines.append(
+                f"💵 <b>الربح/الخسارة المحقق ديال اليوم:</b> "
+                f"{_signed_money(trade_stats.get('realized_pl'))}"
             )
     else:
         lines.append(
@@ -444,20 +478,53 @@ def format_daily_summary(
                 f"(prior close {_money(account.get('last_equity'))})"
             )
 
+    # --- Winning vs losing trades ------------------------------------
+    if trade_stats is not None:
+        if compact:
+            lines.append(
+                f"✅ <b>صفقات رابحة:</b> {trade_stats.get('wins', 0)} | "
+                f"❌ <b>صفقات خاسرة:</b> {trade_stats.get('losses', 0)}"
+            )
+            extras = []
+            if trade_stats.get("breakeven"):
+                extras.append(f"➖ متعادلة: {trade_stats['breakeven']}")
+            if trade_stats.get("unknown"):
+                extras.append(f"⚠️ غير معروفة: {trade_stats['unknown']}")
+            if extras:
+                lines.append(" | ".join(extras))
+            if trade_stats.get("trade_count"):
+                lines.append(
+                    f"🧾 <b>إجمالي الصفقات المغلقة:</b> "
+                    f"{trade_stats['trade_count']} | "
+                    f"<b>الربح المحقق:</b> "
+                    f"{_signed_money(trade_stats.get('realized_pl'))}"
+                )
+        else:
+            lines.append(
+                f"  Trades closed: {trade_stats.get('trade_count', 0)} | "
+                f"winners {trade_stats.get('wins', 0)} | "
+                f"losers {trade_stats.get('losses', 0)} | "
+                f"breakeven {trade_stats.get('breakeven', 0)} | "
+                f"unknown {trade_stats.get('unknown', 0)} | "
+                f"realised P/L {_signed_money(trade_stats.get('realized_pl'))}"
+            )
+
     # --- Open positions ----------------------------------------------
-    header = "📌 Stocks you currently own" if compact else "Open positions"
-    lines.append(f"{header} ({len(positions)}):")
+    if compact:
+        lines.append(f"📌 <b>المراكز المفتوحة ({len(positions)}):</b>")
+    else:
+        lines.append(f"Open positions ({len(positions)}):")
     if not positions:
-        lines.append("  none")
+        lines.append("  • ما كاين حتى مركز مفتوح" if compact else "  none")
     else:
         for position in positions[:max_positions]:
             if compact:
                 lines.append(
-                    f"  {position['symbol']}: {position['qty']:g} shares | "
-                    f"bought at {_money(position['avg_entry'])} | "
-                    f"now {_money(position['current_price'])} | "
-                    f"worth {_money(position['market_value'])} | "
-                    f"profit/loss {_signed_money(position['unrealized_pl'])} "
+                    f"  • <b>{_esc(position['symbol'])}</b>: "
+                    f"{position['qty']:g} سهم | "
+                    f"ثمن الشراء: {_money(position['avg_entry'])} | "
+                    f"الثمن الحالي: {_money(position['current_price'])} | "
+                    f"الربح/الخسارة: {_signed_money(position['unrealized_pl'])} "
                     f"({position['unrealized_plpc'] * 100.0:+.2f}%)"
                 )
             else:
@@ -470,47 +537,91 @@ def format_daily_summary(
                     f"({position['unrealized_plpc'] * 100.0:+.2f}%)"
                 )
         if len(positions) > max_positions:
-            lines.append(f"  ... and {len(positions) - max_positions} more")
+            lines.append(
+                f"  ... و {len(positions) - max_positions} مراكز أخرى"
+                if compact
+                else f"  ... and {len(positions) - max_positions} more"
+            )
 
-    # --- Today's closed orders ---------------------------------------
-    opened = sum(1 for fill in fills if fill["side"] == "buy")
-    closed = sum(1 for fill in fills if fill["side"] == "sell")
+    # --- Today's realised trades / filled orders ---------------------
+    closed_trades = (trade_stats or {}).get("trades") or []
     if compact:
-        lines.append(
-            f"🧾 Trades completed today ({len(fills)} total | "
-            f"{opened} bought / {closed} sold):"
-        )
+        if closed_trades:
+            lines.append(
+                f"🧾 <b>نتائج صفقات اليوم "
+                f"({trade_stats.get('trade_count', len(closed_trades))}):</b>"
+            )
+            for trade in closed_trades[:max_fills]:
+                realised = _as_float(trade.get("realized_pl"))
+                if realised is None:
+                    icon, result = "⚠️", "النتيجة غير معروفة"
+                elif realised > 0:
+                    icon, result = "✅", _signed_money(realised)
+                elif realised < 0:
+                    icon, result = "❌", _signed_money(realised)
+                else:
+                    icon, result = "➖", _signed_money(0.0)
+                qty = _as_float(trade.get("qty"), 0.0) or 0.0
+                lines.append(
+                    f"  {icon} <b>{_esc(trade.get('symbol', '?'))}</b>: "
+                    f"{result} ({qty:g} سهم: "
+                    f"{_money(trade.get('entry_price'))} ← "
+                    f"{_money(trade.get('exit_price'))})"
+                )
+            if len(closed_trades) > max_fills:
+                lines.append(
+                    f"  ... و {len(closed_trades) - max_fills} صفقات أخرى"
+                )
+        else:
+            lines.append(f"🧾 <b>الأوامر المنفذة اليوم ({len(fills)}):</b>")
+            if not fills:
+                lines.append("  • ما كاين حتى أمر منفذ")
+            else:
+                for fill in fills[:max_fills]:
+                    stamp = ""
+                    filled_at = fill.get("filled_at")
+                    if isinstance(filled_at, datetime):
+                        try:
+                            stamp = filled_at.astimezone(
+                                _market_timezone()
+                            ).strftime(" (%H:%M)")
+                        except Exception:
+                            stamp = ""
+                    lines.append(
+                        f"  {arabic_action(fill['side'])} "
+                        f"{fill['qty']:g} سهم من {_esc(fill['symbol'])} "
+                        f"بسعر {_money(fill['price'])}{stamp}"
+                    )
+                if len(fills) > max_fills:
+                    lines.append(
+                        f"  ... و {len(fills) - max_fills} أوامر أخرى"
+                    )
     else:
+        opened = sum(1 for fill in fills if fill["side"] == "buy")
+        closed = sum(1 for fill in fills if fill["side"] == "sell")
         lines.append(
             f"Today's filled (closed) orders ({len(fills)} total | "
             f"{opened} buy / {closed} sell):"
         )
-    if not fills:
-        lines.append("  none")
-    else:
-        for fill in fills[:max_fills]:
-            stamp = ""
-            filled_at = fill.get("filled_at")
-            if isinstance(filled_at, datetime):
-                try:
-                    stamp = filled_at.astimezone(_market_timezone()).strftime(
-                        " (%H:%M)"
-                    )
-                except Exception:
-                    stamp = ""
-            if compact:
-                lines.append(
-                    f"  {plain_action(fill['side'])} "
-                    f"{fill['qty']:g} shares of {fill['symbol']} "
-                    f"at {_money(fill['price'])}{stamp}"
-                )
-            else:
+        if not fills:
+            lines.append("  none")
+        else:
+            for fill in fills[:max_fills]:
+                stamp = ""
+                filled_at = fill.get("filled_at")
+                if isinstance(filled_at, datetime):
+                    try:
+                        stamp = filled_at.astimezone(_market_timezone()).strftime(
+                            " (%H:%M)"
+                        )
+                    except Exception:
+                        stamp = ""
                 lines.append(
                     f"  {fill['side'].upper()} {fill['symbol']} qty {fill['qty']:g} "
                     f"@ {_money(fill['price'])}{stamp} [{fill['status']}]"
                 )
-        if len(fills) > max_fills:
-            lines.append(f"  ... and {len(fills) - max_fills} more")
+            if len(fills) > max_fills:
+                lines.append(f"  ... and {len(fills) - max_fills} more")
 
     return "\n".join(lines)
 
@@ -538,35 +649,47 @@ def bracket_prices(price):
 
 
 # --------------------------------------------------------------------------
-# Notification wording helpers
+# Notification wording helpers (Darija / Arabic)
 # --------------------------------------------------------------------------
-# The Telegram messages are read by humans, not traders, so every template
-# below is written in plain English (no RSI/MACD/sentiment jargon without a
-# plain-language explanation).
-_SENTIMENT_PHRASES = {
-    "positive": "positive news sentiment",
-    "negative": "negative news sentiment",
-    "neutral": "neutral news sentiment",
+# Telegram messages are read by humans, not traders, so every template below
+# avoids technical jargon and uses clear Darija/Arabic. Messages are sent with
+# ``parse_mode="HTML"``; ``<b>`` gives the bold titles from the design while
+# all dynamic values are HTML-escaped.
+_AR_SENTIMENT = {
+    "positive": "الأخبار إيجابية",
+    "negative": "الأخبار سلبية",
+    "neutral": "الأخبار محايدة",
 }
 
 
-def plain_sentiment(label):
-    """Turn a sentiment label into a plain-English phrase, capitalised."""
-    phrase = _SENTIMENT_PHRASES.get(
-        str(label).strip().lower(), f"{label} news sentiment"
-    )
-    return phrase[:1].upper() + phrase[1:]
+def _esc(value):
+    """Escape a dynamic value for Telegram's HTML parse mode."""
+    return html.escape(str(value), quote=False)
 
 
-def plain_action(side):
-    """Map an order side to a plain past-tense verb (``Bought`` / ``Sold``)."""
-    return {"buy": "Bought", "sell": "Sold"}.get(str(side).strip().lower(), "Traded")
+def _bold(value):
+    return f"<b>{_esc(value)}</b>"
 
 
-def plain_side(side):
-    """Map an order side to a plain noun (``buy`` / ``sell`` / ``trade``)."""
-    side = str(side).strip().lower()
-    return side if side in {"buy", "sell"} else "trade"
+def arabic_sentiment(label):
+    """Turn a FinBERT label into a clear Arabic/Darija phrase."""
+    return _AR_SENTIMENT.get(str(label).strip().lower(), "الأخبار غير واضحة")
+
+
+def arabic_action(side):
+    """Map an order side to the bilingual label used in notifications."""
+    return {
+        "buy": "شراء (BUY)",
+        "sell": "بيع (SELL)",
+    }.get(str(side).strip().lower(), "عملية")
+
+
+def arabic_side(side):
+    """Map an order side to the Arabic noun used in problem messages."""
+    return {
+        "buy": "الشراء",
+        "sell": "البيع",
+    }.get(str(side).strip().lower(), "التداول")
 
 
 def plain_quantity(value):
@@ -585,6 +708,81 @@ def plain_price(value):
         return "$n/a"
 
 
+def format_buy_message(symbol, price, stop_loss, take_profit, sentiment_label):
+    """Build the requested Darija buy alert."""
+    return "\n".join(
+        [
+            f"📈 {_bold(f'شراء (BUY) : {symbol}')}",
+            f"• الثمن: {plain_price(price)}",
+            f"• {arabic_sentiment(sentiment_label)}",
+            f"• حد الخسارة: {plain_price(stop_loss)}",
+            f"• حد الربح: {plain_price(take_profit)}",
+        ]
+    )
+
+
+def format_sell_message(symbol, price, reason=None):
+    """Build the requested Darija sell alert."""
+    return "\n".join(
+        [
+            f"📉 {_bold(f'بيع (SELL) : {symbol}')}",
+            f"• الثمن: {plain_price(price)}",
+            f"• {_esc(reason or 'السعر وصل لمستويات مرتفعة')}",
+        ]
+    )
+
+
+def format_fill_message(symbol, side, quantity, price):
+    """Build the Arabic confirmation for a filled order."""
+    return "\n".join(
+        [
+            "✅ <b>تم تنفيذ الأمر</b>",
+            f"• العملية: {arabic_action(side)}",
+            f"• السهم: {_esc(symbol)}",
+            f"• الكمية: {plain_quantity(quantity)} سهم",
+            f"• الثمن: {plain_price(price)}",
+        ]
+    )
+
+
+def format_cancelled_message(symbol, side):
+    """Build the Arabic confirmation for a cancelled order."""
+    return "\n".join(
+        [
+            "❌ <b>تم إلغاء الأمر</b>",
+            f"• أمر {arabic_side(side)} ديال {_esc(symbol)} ما تنفذش.",
+        ]
+    )
+
+
+def format_rejected_message(symbol, side, error_message=None):
+    """Build the Arabic notification for a broker-rejected order."""
+    lines = [
+        "🚫 <b>تم رفض الأمر</b>",
+        f"• أمر {arabic_side(side)} ديال {_esc(symbol)} ترفض من طرف الوسيط.",
+    ]
+    if error_message:
+        lines.append(f"• السبب: {_esc(_truncate(str(error_message), 200))}")
+    return "\n".join(lines)
+
+
+def _order_symbol(order, position=None):
+    """Best-effort symbol lookup across lumibot order/position objects."""
+    for source in (order, position):
+        if source is None:
+            continue
+        symbol = getattr(source, "symbol", None)
+        if symbol:
+            return symbol
+        asset = getattr(source, "asset", None)
+        if isinstance(asset, str) and asset:
+            return asset
+        symbol = getattr(asset, "symbol", None)
+        if symbol:
+            return symbol
+    return "?"
+
+
 class MLTraderProMax(Strategy):
     def initialize(self):
         configure_logging()  # idempotent; ensures file handler exists
@@ -592,6 +790,9 @@ class MLTraderProMax(Strategy):
         self._log = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
         # Guards against producing the end-of-day report twice in one day.
         self._eod_summary_date = None
+        # Persistent FIFO ledger used to report today's winning/losing trades.
+        self._trade_ledger = DailyTradeLedger(TRADE_LEDGER_FILE)
+        self._ledger_sync_date = None
         self._log.info(
             "Strategy initialised (watchlist=%s, workers=%d, feed=%s)",
             WATCHLIST,
@@ -829,13 +1030,19 @@ class MLTraderProMax(Strategy):
                     take_profit_price,
                 )
                 self.telegram_send_message(
-                    f"📈 Bought {symbol} at {plain_price(price)} — "
-                    f"{plain_sentiment(label)}. "
-                    f"Stop Loss: {plain_price(stop_loss_price)}, "
-                    f"Take Profit: {plain_price(take_profit_price)}"
+                    format_buy_message(
+                        symbol,
+                        price,
+                        stop_loss_price,
+                        take_profit_price,
+                        label,
+                    )
                 )
             except Exception as exc:
                 logger.error("[%s] BUY order failed: %s", symbol, exc)
+                self.telegram_send_message(
+                    format_rejected_message(symbol, "buy", exc)
+                )
 
         # --- SELL --------------------------------------------------------
         elif rsi > RSI_OVERBOUGHT:
@@ -855,18 +1062,19 @@ class MLTraderProMax(Strategy):
                 self._log.info(
                     "SELL %s qty=%s @ %.2f (rsi=%.1f)", symbol, pos.quantity, price, rsi
                 )
-                self.telegram_send_message(
-                    f"📉 Sold {symbol} at {plain_price(price)} — "
-                    f"Price reached high momentum/overbought levels, "
-                    f"so we closed the position."
-                )
+                self.telegram_send_message(format_sell_message(symbol, price))
             except Exception as exc:
                 logger.error("[%s] SELL order failed: %s", symbol, exc)
+                self.telegram_send_message(
+                    format_rejected_message(symbol, "sell", exc)
+                )
 
     # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
     def on_trading_iteration(self):
+        # Seed any position opened before the ledger existed (once per day).
+        self._sync_trade_ledger()
         try:
             analyses = self._analyze_watchlist()
         except Exception as exc:
@@ -881,38 +1089,40 @@ class MLTraderProMax(Strategy):
                     "[%s] execution failed: %s", data.get("symbol"), exc, exc_info=True
                 )
 
-    def on_order_event(self, order_event):
+    def on_filled_order(self, position, order, price, quantity, multiplier):
+        """lumibot lifecycle hook: confirm the fill and feed the trade ledger."""
         try:
-            order = order_event.order
-            logger.info(
-                "Order event: %s %s -> %s",
-                order.symbol,
-                order.side.upper(),
-                order_event.status,
+            symbol = _order_symbol(order, position)
+            side = _enum_value(getattr(order, "side", None))
+            filled_qty = quantity if quantity is not None else getattr(
+                order, "quantity", None
             )
-            if order_event.status == "filled":
-                self.telegram_send_message(
-                    f"✅ Order filled: {plain_action(order.side)} "
-                    f"{plain_quantity(order.quantity)} shares of "
-                    f"{order.symbol} at {plain_price(order.average_fill_price)}"
-                )
-            elif order_event.status == "cancelled":
-                self.telegram_send_message(
-                    f"❌ Order cancelled: your {plain_side(order.side)} order "
-                    f"for {order.symbol} was not completed."
-                )
-            elif order_event.status == "rejected":
-                self.telegram_send_message(
-                    f"🚫 Order rejected: your {plain_side(order.side)} order "
-                    f"for {order.symbol} was refused by the broker "
-                    f"({order.error_message})."
-                )
+            fill_id = getattr(order, "identifier", None) or getattr(
+                order, "id", None
+            )
+            self._record_trade_fill(symbol, side, filled_qty, price, fill_id)
+            self.telegram_send_message(
+                format_fill_message(symbol, side, filled_qty, price)
+            )
         except Exception as exc:
-            logger.error("on_order_event failed: %s", exc, exc_info=True)
+            logger.error("on_filled_order failed: %s", exc, exc_info=True)
+
+    def on_canceled_order(self, order):
+        """lumibot lifecycle hook: tell the user an order was not completed."""
+        try:
+            symbol = _order_symbol(order)
+            side = _enum_value(getattr(order, "side", None))
+            self.telegram_send_message(format_cancelled_message(symbol, side))
+        except Exception as exc:
+            logger.error("on_canceled_order failed: %s", exc, exc_info=True)
 
     # ------------------------------------------------------------------
     # End-of-day lifecycle (market close)
     # ------------------------------------------------------------------
+    def before_market_opens(self):
+        """Snapshot opening positions before any order can close them."""
+        self._sync_trade_ledger()
+
     def after_market_closes(self):
         """lumibot lifecycle hook, invoked once after the market closes.
 
@@ -956,11 +1166,24 @@ class MLTraderProMax(Strategy):
 
         # 2. Fetch and print positions / today's fills / account balance.
         snapshot = self._end_of_day_snapshot()
+        ledger = getattr(self, "_trade_ledger", None)
+        if ledger is not None:
+            try:
+                reconciled = ledger.reconcile_fills(snapshot["fills"])
+                if reconciled:
+                    self._log.info(
+                        "Trade ledger reconciled %d fill(s) from Alpaca",
+                        reconciled,
+                    )
+            except Exception as exc:
+                self._log.warning("Trade ledger reconciliation failed: %s", exc)
+        trade_stats = ledger.stats(today) if ledger is not None else None
         report = format_daily_summary(
             today,
             snapshot["account"],
             snapshot["positions"],
             snapshot["fills"],
+            trade_stats=trade_stats,
         )
         # The console handler makes this visible on stdout, and the rotating
         # file handler keeps a copy in logs/.
@@ -978,11 +1201,91 @@ class MLTraderProMax(Strategy):
             snapshot["account"],
             snapshot["positions"],
             snapshot["fills"],
+            trade_stats=trade_stats,
             compact=True,
         )
-        # Telegram rejects messages longer than 4096 characters.
-        self.telegram_send_message(_truncate(telegram_text, 3900))
+        # Telegram rejects messages longer than 4096 characters. Truncating on
+        # line boundaries also keeps the HTML tags balanced.
+        self.telegram_send_message(_truncate(telegram_text, 3900), wait=True)
         self._log.info("Daily summary dispatched to Telegram")
+
+    def _sync_trade_ledger(self):
+        """Seed the ledger with currently open positions once per day.
+
+        This covers positions opened before the bot (or the ledger file) was
+        started, so their eventual sell still counts as a winning/losing trade.
+        """
+        ledger = getattr(self, "_trade_ledger", None)
+        if ledger is None or getattr(self, "is_backtesting", False):
+            return
+
+        today = datetime.now(_market_timezone()).strftime("%Y-%m-%d")
+        if self._ledger_sync_date == today:
+            return
+
+        # Prefer Alpaca positions because they include the average entry price
+        # needed for a meaningful P/L when the position is later sold.
+        normalized = []
+        api = getattr(getattr(self, "broker", None), "api", None)
+        if api is not None:
+            try:
+                normalized = _positions_snapshot(api)
+            except Exception as exc:
+                self._log.warning(
+                    "Could not read Alpaca positions for trade ledger: %s", exc
+                )
+
+        if not normalized:
+            try:
+                positions = self.get_positions() or []
+            except Exception as exc:
+                self._log.warning(
+                    "Could not sync positions to trade ledger: %s", exc
+                )
+                return
+            for position in positions:
+                asset = getattr(position, "asset", None)
+                symbol = getattr(asset, "symbol", None) or getattr(
+                    position, "symbol", None
+                )
+                normalized.append(
+                    {
+                        "symbol": symbol,
+                        "qty": getattr(position, "quantity", None),
+                        "avg_entry": getattr(position, "avg_entry_price", None),
+                    }
+                )
+
+        seeded = ledger.seed_positions(normalized)
+        if seeded:
+            self._log.info(
+                "Trade ledger seeded existing positions: %s", ", ".join(seeded)
+            )
+        self._ledger_sync_date = today
+
+    def _record_trade_fill(self, symbol, side, quantity, price, fill_id=None):
+        """Record a filled order in the ledger used by the daily report."""
+        ledger = getattr(self, "_trade_ledger", None)
+        if ledger is None:
+            return
+        try:
+            trade = ledger.record_fill(
+                symbol,
+                _enum_value(side),
+                quantity,
+                price,
+                fill_id=fill_id,
+            )
+        except Exception as exc:
+            self._log.warning("Could not record fill in trade ledger: %s", exc)
+            return
+
+        if trade and trade.get("side") == "sell":
+            self._log.info(
+                "Trade ledger: %s realised P/L %s",
+                trade.get("symbol"),
+                _signed_money(trade.get("realized_pl")),
+            )
 
     def _end_of_day_snapshot(self):
         """Collect account, positions and today's fills from Alpaca.
@@ -1063,11 +1366,18 @@ class MLTraderProMax(Strategy):
     # ------------------------------------------------------------------
     # Alerting (non-blocking, retried on the alert pool)
     # ------------------------------------------------------------------
-    def telegram_send_message(self, message):
+    def telegram_send_message(self, message, wait=False):
+        """Queue a Telegram alert; ``wait=True`` blocks until it is sent.
+
+        The end-of-day report waits so the message cannot be lost if the
+        process exits right after the market-close hook.
+        """
         if not TELEGRAM_ENABLED:
             return
         try:
-            _alert_pool.submit(_send_telegram, message)
+            future = _alert_pool.submit(_send_telegram, message)
+            if wait:
+                future.result()
         except Exception as exc:
             logger.warning("Telegram dispatch failed: %s", exc)
 
@@ -1077,7 +1387,12 @@ def _send_telegram(message: str) -> None:
     if not TELEGRAM_ENABLED or not TELEGRAM_TOKEN:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
     try:
         call_with_retry(
             requests.post,
