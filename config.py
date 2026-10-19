@@ -139,6 +139,15 @@ TELEGRAM_TIMEOUT = _env_float("TELEGRAM_TIMEOUT", 5)
 TELEGRAM_RETRY_ATTEMPTS = _env_int("TELEGRAM_RETRY_ATTEMPTS", 3)
 
 # ---------------------------------------------------------------------------
+# End-of-day summary
+# ---------------------------------------------------------------------------
+# When enabled, an end-of-day report (open positions, today's fills and the
+# account balance) is logged and pushed to Telegram right after the market
+# closes. MARKET_TIMEZONE defines what "today" means for the report.
+DAILY_SUMMARY_ENABLED = _env_bool("DAILY_SUMMARY_ENABLED", True)
+MARKET_TIMEZONE = _env_str("MARKET_TIMEZONE", "America/New_York")
+
+# ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 LOG_LEVEL = _env_str("LOG_LEVEL", "INFO").upper()

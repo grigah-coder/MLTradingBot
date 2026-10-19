@@ -10,6 +10,7 @@ An asynchronous, production-ready automated algorithmic trading bot built in Pyt
 - **TTL Caching:** Built-in in-memory caching for news, sentiment scores, and technical indicators to minimize redundant API calls and processing overhead.
 - **Resilient Error Handling:** Robust exponential backoff with jitter for network failures and Alpaca rate limits.
 - **Automated Alerts:** Dispatches instant status updates (fills, rejections, buy/sell actions) directly to **Telegram**.
+- **End-of-Day Report:** When the market closes, logs and sends a daily summary with the account balance, open positions and today's filled orders.
 - **Risk Management:** Features built-in Stop Loss, Take Profit, and bracket order fallback mechanics.
 
 ---
@@ -57,6 +58,9 @@ MLTradingBot/
    ALPACA_PAPER=True
    TELEGRAM_TOKEN=your_telegram_bot_token
    TELEGRAM_CHAT_ID=your_telegram_chat_id
+   # Optional: end-of-day report controls
+   DAILY_SUMMARY_ENABLED=True
+   MARKET_TIMEZONE=America/New_York
    ```
 
 ---

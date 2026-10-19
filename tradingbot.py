@@ -21,7 +21,8 @@ import hashlib
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import numpy as np # pyright: ignore[reportMissingImports]
 import pandas as pd # pyright: ignore[reportMissingModuleSource]
@@ -29,6 +30,15 @@ import requests # pyright: ignore[reportMissingModuleSource]
 from alpaca.data.historical.news import NewsClient # pyright: ignore[reportMissingImports]
 from alpaca.data.requests import NewsRequest # pyright: ignore[reportMissingImports]
 from lumibot.brokers import Alpaca # pyright: ignore[reportMissingImports]
+
+# Trading-side alpaca-py imports (used by the end-of-day summary). Kept soft so
+# a leaner alpaca-py install cannot break importing the whole bot.
+try:  # pragma: no cover - depends on alpaca-py version
+    from alpaca.trading.enums import QueryOrderStatus # pyright: ignore[reportMissingImports]
+    from alpaca.trading.requests import GetOrdersRequest # pyright: ignore[reportMissingImports]
+except Exception:  # pragma: no cover
+    QueryOrderStatus = None  # type: ignore
+    GetOrdersRequest = None  # type: ignore
 from lumibot.strategies.strategy import Strategy # pyright: ignore[reportMissingImports]
 from lumibot.traders import Trader # pyright: ignore[reportMissingImports]
 
@@ -62,6 +72,8 @@ from config import (
     TELEGRAM_ENABLED,
     TELEGRAM_TIMEOUT,
     TELEGRAM_RETRY_ATTEMPTS,
+    DAILY_SUMMARY_ENABLED,
+    MARKET_TIMEZONE,
     RETRY_ATTEMPTS,
     RETRY_BASE_DELAY,
     RETRY_MAX_DELAY,
@@ -253,11 +265,333 @@ def compute_indicators(df: pd.DataFrame):
     }
 
 
+# --------------------------------------------------------------------------
+# End-of-day reporting helpers
+# --------------------------------------------------------------------------
+def _market_timezone():
+    """Resolve ``MARKET_TIMEZONE``, falling back to UTC if tzdata is absent."""
+    try:
+        return ZoneInfo(MARKET_TIMEZONE)
+    except Exception:
+        logger.warning(
+            "Unknown MARKET_TIMEZONE=%r; falling back to UTC", MARKET_TIMEZONE
+        )
+        return timezone.utc
+
+
+def _start_of_trading_day(now=None):
+    """Return market-local midnight of the current day (tz-aware)."""
+    tz = _market_timezone()
+    moment = now.astimezone(tz) if now is not None else datetime.now(tz)
+    return moment.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _as_float(value, default=0.0):
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _enum_value(value):
+    """Normalise alpaca-py enums (``OrderSide.BUY`` -> ``"buy"``) to a string."""
+    value = getattr(value, "value", value)
+    return "" if value is None else str(value)
+
+
+def _money(value):
+    return "n/a" if value is None else f"${value:,.2f}"
+
+
+def _signed_money(value):
+    if value is None:
+        return "n/a"
+    return f"{'+' if value >= 0 else '-'}${abs(value):,.2f}"
+
+
+def _truncate(text, limit):
+    return text if len(text) <= limit else text[: max(0, limit - 3)] + "..."
+
+
+def _account_snapshot(api):
+    """Fetch the Alpaca account balances as a plain dict."""
+    account = _retry(api.get_account, description="alpaca_get_account")
+    equity = _as_float(getattr(account, "equity", None))
+    last_equity = _as_float(getattr(account, "last_equity", None))
+    day_pl = (equity - last_equity) if last_equity else None
+    day_pl_pct = (
+        (day_pl / last_equity * 100.0)
+        if day_pl is not None and last_equity
+        else None
+    )
+    return {
+        "status": _enum_value(getattr(account, "status", None)),
+        "cash": _as_float(getattr(account, "cash", None)),
+        "equity": equity,
+        "portfolio_value": _as_float(getattr(account, "portfolio_value", None)),
+        "buying_power": _as_float(getattr(account, "buying_power", None)),
+        "long_market_value": _as_float(getattr(account, "long_market_value", None)),
+        "short_market_value": _as_float(getattr(account, "short_market_value", None)),
+        "last_equity": last_equity,
+        "day_pl": day_pl,
+        "day_pl_pct": day_pl_pct,
+    }
+
+
+def _positions_snapshot(api):
+    """Fetch every open Alpaca position with its P/L as plain dicts."""
+    raw = _retry(api.get_all_positions, description="alpaca_get_all_positions") or []
+    positions = []
+    for position in raw:
+        positions.append(
+            {
+                "symbol": getattr(position, "symbol", "?"),
+                "qty": _as_float(getattr(position, "qty", None)),
+                "avg_entry": _as_float(getattr(position, "avg_entry_price", None)),
+                "current_price": _as_float(getattr(position, "current_price", None)),
+                "market_value": _as_float(getattr(position, "market_value", None)),
+                "unrealized_pl": _as_float(getattr(position, "unrealized_pl", None)),
+                "unrealized_plpc": _as_float(getattr(position, "unrealized_plpc", None)),
+            }
+        )
+    return positions
+
+
+def _filled_orders_snapshot(api, since):
+    """Return today's filled orders (i.e. today's closed/open trades)."""
+    if GetOrdersRequest is None or QueryOrderStatus is None:
+        logger.warning("alpaca-py trading enums unavailable; skipping fills summary")
+        return []
+    request = GetOrdersRequest(
+        status=QueryOrderStatus.CLOSED,
+        after=since,
+        limit=500,
+    )
+    orders = (
+        _retry(api.get_orders, filter=request, description="alpaca_get_orders") or []
+    )
+    fills = []
+    for order in orders:
+        filled_qty = _as_float(getattr(order, "filled_qty", None))
+        if filled_qty <= 0:
+            continue
+        fills.append(
+            {
+                "symbol": getattr(order, "symbol", "?"),
+                "side": _enum_value(getattr(order, "side", "")).lower(),
+                "qty": filled_qty,
+                "price": _as_float(getattr(order, "filled_avg_price", None)),
+                "status": _enum_value(getattr(order, "status", "")).lower(),
+                "filled_at": getattr(order, "filled_at", None),
+            }
+        )
+    return fills
+
+
+def format_daily_summary(
+    date_str,
+    account,
+    positions,
+    fills,
+    *,
+    max_positions=20,
+    max_fills=20,
+    compact=False,
+):
+    """Render the end-of-day report as text.
+
+    ``compact=True`` produces the shorter, emoji-rich variant sent to
+    Telegram; the default is the verbose form written to the log.
+    """
+    lines = []
+    if compact:
+        lines.append(f"📊 Daily summary — {date_str}")
+    else:
+        lines.append(f"End-of-day summary for {date_str}")
+
+    # --- Account balance ---------------------------------------------
+    if account is None:
+        lines.append("Account: balance unavailable (Alpaca account fetch failed)")
+    elif compact:
+        lines.append(
+            f"💰 Account value: {_money(account['equity'])} | "
+            f"Cash: {_money(account['cash'])} | "
+            f"Available to trade: {_money(account['buying_power'])}"
+        )
+        if account.get("day_pl") is not None:
+            pct = account.get("day_pl_pct")
+            pct_txt = f" ({pct:+.2f}%)" if pct is not None else ""
+            arrow = "📈" if account["day_pl"] >= 0 else "📉"
+            lines.append(
+                f"{arrow} Today's profit/loss: "
+                f"{_signed_money(account['day_pl'])}{pct_txt}"
+            )
+    else:
+        lines.append(
+            f"Account: equity {_money(account['equity'])} | "
+            f"cash {_money(account['cash'])} | "
+            f"buying power {_money(account['buying_power'])} | "
+            f"long {_money(account['long_market_value'])} | "
+            f"short {_money(account['short_market_value'])}"
+        )
+        if account.get("day_pl") is not None:
+            pct = account.get("day_pl_pct")
+            pct_txt = f" ({pct:+.2f}%)" if pct is not None else ""
+            lines.append(
+                f"  Day P/L: {_signed_money(account['day_pl'])}{pct_txt} "
+                f"(prior close {_money(account.get('last_equity'))})"
+            )
+
+    # --- Open positions ----------------------------------------------
+    header = "📌 Stocks you currently own" if compact else "Open positions"
+    lines.append(f"{header} ({len(positions)}):")
+    if not positions:
+        lines.append("  none")
+    else:
+        for position in positions[:max_positions]:
+            if compact:
+                lines.append(
+                    f"  {position['symbol']}: {position['qty']:g} shares | "
+                    f"bought at {_money(position['avg_entry'])} | "
+                    f"now {_money(position['current_price'])} | "
+                    f"worth {_money(position['market_value'])} | "
+                    f"profit/loss {_signed_money(position['unrealized_pl'])} "
+                    f"({position['unrealized_plpc'] * 100.0:+.2f}%)"
+                )
+            else:
+                lines.append(
+                    f"  {position['symbol']}: qty {position['qty']:g} | "
+                    f"entry {_money(position['avg_entry'])} | "
+                    f"last {_money(position['current_price'])} | "
+                    f"value {_money(position['market_value'])} | "
+                    f"P/L {_signed_money(position['unrealized_pl'])} "
+                    f"({position['unrealized_plpc'] * 100.0:+.2f}%)"
+                )
+        if len(positions) > max_positions:
+            lines.append(f"  ... and {len(positions) - max_positions} more")
+
+    # --- Today's closed orders ---------------------------------------
+    opened = sum(1 for fill in fills if fill["side"] == "buy")
+    closed = sum(1 for fill in fills if fill["side"] == "sell")
+    if compact:
+        lines.append(
+            f"🧾 Trades completed today ({len(fills)} total | "
+            f"{opened} bought / {closed} sold):"
+        )
+    else:
+        lines.append(
+            f"Today's filled (closed) orders ({len(fills)} total | "
+            f"{opened} buy / {closed} sell):"
+        )
+    if not fills:
+        lines.append("  none")
+    else:
+        for fill in fills[:max_fills]:
+            stamp = ""
+            filled_at = fill.get("filled_at")
+            if isinstance(filled_at, datetime):
+                try:
+                    stamp = filled_at.astimezone(_market_timezone()).strftime(
+                        " (%H:%M)"
+                    )
+                except Exception:
+                    stamp = ""
+            if compact:
+                lines.append(
+                    f"  {plain_action(fill['side'])} "
+                    f"{fill['qty']:g} shares of {fill['symbol']} "
+                    f"at {_money(fill['price'])}{stamp}"
+                )
+            else:
+                lines.append(
+                    f"  {fill['side'].upper()} {fill['symbol']} qty {fill['qty']:g} "
+                    f"@ {_money(fill['price'])}{stamp} [{fill['status']}]"
+                )
+        if len(fills) > max_fills:
+            lines.append(f"  ... and {len(fills) - max_fills} more")
+
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# Order pricing helpers
+# --------------------------------------------------------------------------
+# Alpaca rejects bracket orders whose stop/take-profit prices are not on a
+# valid tick increment (error 42210000, "sub-penny increment does not fulfill
+# minimum pricing criteria"). Stocks at/above $1.00 must use whole cents.
+_MIN_PRICE_TICK = 0.01
+
+
+def round_price(value):
+    """Round ``value`` to a valid Alpaca price increment (whole cents)."""
+    return max(_MIN_PRICE_TICK, round(float(value), 2))
+
+
+def bracket_prices(price):
+    """Return ``(stop_loss, take_profit)`` on valid cent increments."""
+    return (
+        round_price(price * STOP_LOSS_PCT),
+        round_price(price * TAKE_PROFIT_PCT),
+    )
+
+
+# --------------------------------------------------------------------------
+# Notification wording helpers
+# --------------------------------------------------------------------------
+# The Telegram messages are read by humans, not traders, so every template
+# below is written in plain English (no RSI/MACD/sentiment jargon without a
+# plain-language explanation).
+_SENTIMENT_PHRASES = {
+    "positive": "positive news sentiment",
+    "negative": "negative news sentiment",
+    "neutral": "neutral news sentiment",
+}
+
+
+def plain_sentiment(label):
+    """Turn a sentiment label into a plain-English phrase, capitalised."""
+    phrase = _SENTIMENT_PHRASES.get(
+        str(label).strip().lower(), f"{label} news sentiment"
+    )
+    return phrase[:1].upper() + phrase[1:]
+
+
+def plain_action(side):
+    """Map an order side to a plain past-tense verb (``Bought`` / ``Sold``)."""
+    return {"buy": "Bought", "sell": "Sold"}.get(str(side).strip().lower(), "Traded")
+
+
+def plain_side(side):
+    """Map an order side to a plain noun (``buy`` / ``sell`` / ``trade``)."""
+    side = str(side).strip().lower()
+    return side if side in {"buy", "sell"} else "trade"
+
+
+def plain_quantity(value):
+    """Format a share quantity without spurious decimals."""
+    try:
+        return f"{float(value):g}"
+    except (TypeError, ValueError):
+        return "?"
+
+
+def plain_price(value):
+    """Format a price as US dollars, tolerating a missing value."""
+    try:
+        return f"${float(value):,.2f}"
+    except (TypeError, ValueError):
+        return "$n/a"
+
+
 class MLTraderProMax(Strategy):
     def initialize(self):
         configure_logging()  # idempotent; ensures file handler exists
         self.sleeptime = SLEEPTIME
         self._log = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
+        # Guards against producing the end-of-day report twice in one day.
+        self._eod_summary_date = None
         self._log.info(
             "Strategy initialised (watchlist=%s, workers=%d, feed=%s)",
             WATCHLIST,
@@ -430,8 +764,8 @@ class MLTraderProMax(Strategy):
 
     def _create_entry_order(self, symbol, quantity, price):
         """Create the buy order, falling back from bracket to market if needed."""
-        stop_loss_price = price * STOP_LOSS_PCT
-        take_profit_price = price * TAKE_PROFIT_PCT
+        # Alpaca requires whole-cent increments for stop/limit prices.
+        stop_loss_price, take_profit_price = bracket_prices(price)
         try:
             return self.create_order(
                 symbol,
@@ -481,6 +815,7 @@ class MLTraderProMax(Strategy):
                 return
 
             try:
+                stop_loss_price, take_profit_price = bracket_prices(price)
                 order = self._create_entry_order(symbol, quantity, price)
                 self._submit_with_retry(order)
                 self._log.info(
@@ -490,13 +825,14 @@ class MLTraderProMax(Strategy):
                     price,
                     rsi,
                     label,
-                    price * STOP_LOSS_PCT,
-                    price * TAKE_PROFIT_PCT,
+                    stop_loss_price,
+                    take_profit_price,
                 )
                 self.telegram_send_message(
-                    f"✅ BUY {symbol} @ {price:.2f} (Sentiment: {label}, "
-                    f"SL: {price * STOP_LOSS_PCT:.2f}, "
-                    f"TP: {price * TAKE_PROFIT_PCT:.2f})"
+                    f"📈 Bought {symbol} at {plain_price(price)} — "
+                    f"{plain_sentiment(label)}. "
+                    f"Stop Loss: {plain_price(stop_loss_price)}, "
+                    f"Take Profit: {plain_price(take_profit_price)}"
                 )
             except Exception as exc:
                 logger.error("[%s] BUY order failed: %s", symbol, exc)
@@ -520,7 +856,9 @@ class MLTraderProMax(Strategy):
                     "SELL %s qty=%s @ %.2f (rsi=%.1f)", symbol, pos.quantity, price, rsi
                 )
                 self.telegram_send_message(
-                    f"💰 SELL {symbol} @ {price:.2f} (RSI > {RSI_OVERBOUGHT:.0f})"
+                    f"📉 Sold {symbol} at {plain_price(price)} — "
+                    f"Price reached high momentum/overbought levels, "
+                    f"so we closed the position."
                 )
             except Exception as exc:
                 logger.error("[%s] SELL order failed: %s", symbol, exc)
@@ -554,20 +892,173 @@ class MLTraderProMax(Strategy):
             )
             if order_event.status == "filled":
                 self.telegram_send_message(
-                    f"📈 FILLED: {order.symbol} {order.side.upper()} "
-                    f"{order.quantity} @ {order.average_fill_price}"
+                    f"✅ Order filled: {plain_action(order.side)} "
+                    f"{plain_quantity(order.quantity)} shares of "
+                    f"{order.symbol} at {plain_price(order.average_fill_price)}"
                 )
             elif order_event.status == "cancelled":
                 self.telegram_send_message(
-                    f"❌ CANCELLED: {order.symbol} {order.side.upper()}"
+                    f"❌ Order cancelled: your {plain_side(order.side)} order "
+                    f"for {order.symbol} was not completed."
                 )
             elif order_event.status == "rejected":
                 self.telegram_send_message(
-                    f"🚫 REJECTED: {order.symbol} {order.side.upper()} - "
-                    f"{order.error_message}"
+                    f"🚫 Order rejected: your {plain_side(order.side)} order "
+                    f"for {order.symbol} was refused by the broker "
+                    f"({order.error_message})."
                 )
         except Exception as exc:
             logger.error("on_order_event failed: %s", exc, exc_info=True)
+
+    # ------------------------------------------------------------------
+    # End-of-day lifecycle (market close)
+    # ------------------------------------------------------------------
+    def after_market_closes(self):
+        """lumibot lifecycle hook, invoked once after the market closes.
+
+        Produces the daily report, so failures here must never bubble up into
+        the executor (which would treat it as a bot crash).
+        """
+        if not DAILY_SUMMARY_ENABLED:
+            self._log.debug(
+                "DAILY_SUMMARY_ENABLED is false; skipping end-of-day summary"
+            )
+            return
+        if getattr(self, "is_backtesting", False):
+            # Backtests replay many "closes" per run; never hit the live
+            # Alpaca account or Telegram from a simulation.
+            self._log.debug("Backtesting; skipping end-of-day summary")
+            return
+        try:
+            self.run_after_hours_summary()
+        except Exception as exc:
+            logger.error("End-of-day summary failed: %s", exc, exc_info=True)
+
+    def run_after_hours_summary(self, reason="the US stock market has closed"):
+        """Log today's report and push it to Telegram when configured.
+
+        Safe to call more than once: only the first call per market day does
+        any work, so it can also be triggered manually from the trading loop
+        if "trading hours have ended" is detected outside the lifecycle hook.
+        """
+        today = datetime.now(_market_timezone()).strftime("%Y-%m-%d")
+        if self._eod_summary_date == today:
+            self._log.debug("End-of-day summary already produced for %s", today)
+            return
+        self._eod_summary_date = today
+
+        # 1. Clear, explicit log message that trading has ended.
+        self._log.info(
+            "Market closed: %s. Building end-of-day summary for %s.",
+            reason,
+            today,
+        )
+
+        # 2. Fetch and print positions / today's fills / account balance.
+        snapshot = self._end_of_day_snapshot()
+        report = format_daily_summary(
+            today,
+            snapshot["account"],
+            snapshot["positions"],
+            snapshot["fills"],
+        )
+        # The console handler makes this visible on stdout, and the rotating
+        # file handler keeps a copy in logs/.
+        self._log.info("Daily performance summary:\n%s", report)
+
+        # 3. Telegram daily summary (only when alerts are configured).
+        if not TELEGRAM_ENABLED or not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+            self._log.info(
+                "Telegram is not configured; daily summary kept local only"
+            )
+            return
+
+        telegram_text = format_daily_summary(
+            today,
+            snapshot["account"],
+            snapshot["positions"],
+            snapshot["fills"],
+            compact=True,
+        )
+        # Telegram rejects messages longer than 4096 characters.
+        self.telegram_send_message(_truncate(telegram_text, 3900))
+        self._log.info("Daily summary dispatched to Telegram")
+
+    def _end_of_day_snapshot(self):
+        """Collect account, positions and today's fills from Alpaca.
+
+        Each section is fetched independently so a single failing endpoint
+        still yields a useful partial report. Never raises.
+        """
+        snapshot = {"account": None, "positions": [], "fills": []}
+        api = getattr(self.broker, "api", None)
+
+        if api is None:  # e.g. a non-Alpaca broker or backtesting
+            self._log.warning(
+                "Alpaca trading client unavailable; using strategy fallbacks"
+            )
+            return self._fallback_snapshot()
+
+        try:
+            snapshot["account"] = _account_snapshot(api)
+        except Exception as exc:
+            self._log.warning("Could not fetch Alpaca account balance: %s", exc)
+
+        try:
+            snapshot["positions"] = _positions_snapshot(api)
+        except Exception as exc:
+            self._log.warning("Could not fetch Alpaca positions: %s", exc)
+
+        try:
+            snapshot["fills"] = _filled_orders_snapshot(
+                api, _start_of_trading_day()
+            )
+        except Exception as exc:
+            self._log.warning("Could not fetch today's Alpaca orders: %s", exc)
+
+        return snapshot
+
+    def _fallback_snapshot(self):
+        """Minimal snapshot built from lumibot's tracked state."""
+        snapshot = {"account": None, "positions": [], "fills": []}
+        try:
+            equity = _as_float(self.get_portfolio_value())
+            cash = _as_float(self.get_cash())
+            snapshot["account"] = {
+                "status": "unknown",
+                "cash": cash,
+                "equity": equity,
+                "portfolio_value": equity,
+                "buying_power": cash,
+                "long_market_value": 0.0,
+                "short_market_value": 0.0,
+                "last_equity": 0.0,
+                "day_pl": None,
+                "day_pl_pct": None,
+            }
+        except Exception as exc:
+            self._log.warning("Fallback account lookup failed: %s", exc)
+
+        try:
+            for position in self.get_positions() or []:
+                asset = getattr(position, "asset", None)
+                snapshot["positions"].append(
+                    {
+                        "symbol": getattr(asset, "symbol", "?"),
+                        "qty": _as_float(getattr(position, "quantity", None)),
+                        "avg_entry": _as_float(
+                            getattr(position, "avg_entry_price", None)
+                        ),
+                        "current_price": 0.0,
+                        "market_value": 0.0,
+                        "unrealized_pl": 0.0,
+                        "unrealized_plpc": 0.0,
+                    }
+                )
+        except Exception as exc:
+            self._log.warning("Fallback position lookup failed: %s", exc)
+
+        return snapshot
 
     # ------------------------------------------------------------------
     # Alerting (non-blocking, retried on the alert pool)
