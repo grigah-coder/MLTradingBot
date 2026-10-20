@@ -9,9 +9,9 @@ An asynchronous, production-ready automated algorithmic trading bot built in Pyt
 - **Sentiment Analysis:** Evaluates recent financial headlines via Hugging Face's **FinBERT** transformer model.
 - **TTL Caching:** Built-in in-memory caching for news, sentiment scores, and technical indicators to minimize redundant API calls and processing overhead.
 - **Resilient Error Handling:** Robust exponential backoff with jitter for network failures and Alpaca rate limits.
-- **Automated Alerts:** Dispatches instant status updates (fills, cancellations, buy/sell actions) directly to **Telegram** in clear **Darija/Arabic**.
+- **Automated Alerts:** Dispatches instant status updates (fills, cancellations, buy/sell actions) directly to **Telegram** in clear **Darija/Arabic**, including a once-per-session startup message with the current balance.
 - **End-of-Day Report:** When the market closes, logs and sends an Arabic daily summary with daily profit/loss ($ and %), winning vs losing trades, the portfolio balance and open positions.
-- **Risk Management:** Features built-in Stop Loss, Take Profit, and bracket order fallback mechanics.
+- **Risk Management:** Opening-volatility time filter (no trades 09:30–10:00 ET), risk-based position sizing with hard caps, and strictly enforced Stop Loss / Take Profit on every entry via bracket orders.
 
 ---
 
@@ -63,7 +63,28 @@ MLTradingBot/
    DAILY_SUMMARY_ENABLED=True
    MARKET_TIMEZONE=America/New_York
    TRADE_LEDGER_FILE=logs/trade_ledger.json
+   # Optional: risk controls (defaults shown)
+   TIME_FILTER_ENABLED=True
+   MARKET_OPEN_TIME=09:30
+   OPENING_BLACKOUT_MINUTES=30
+   POSITION_SIZE_PCT=0.02
+   MAX_PORTFOLIO_RISK_PCT=0.01
+   MAX_SHARES_PER_TRADE=100
+   STOP_LOSS_PCT=0.98
+   TAKE_PROFIT_PCT=1.04
+   MIN_REWARD_RISK_RATIO=1.0
+   REQUIRE_PROTECTIVE_ORDERS=True
+   SESSION_START_MESSAGE_ENABLED=True
    ```
+
+   **Risk controls in detail**
+   - `TIME_FILTER_ENABLED` / `MARKET_OPEN_TIME` / `OPENING_BLACKOUT_MINUTES`: no strategy order (buy or sell) is submitted during the first 30 minutes after the market open. Times use `MARKET_TIMEZONE`, so EST and EDT are handled automatically.
+   - `MAX_PORTFOLIO_RISK_PCT`: maximum equity at risk per trade when the stop loss is hit (default 1%).
+   - `POSITION_SIZE_PCT`: maximum notional value of one entry as a fraction of available cash (default 2%).
+   - `MAX_SHARES_PER_TRADE`: hard share cap per entry; set to `0` to disable.
+   - `STOP_LOSS_PCT` / `TAKE_PROFIT_PCT`: bracket legs, validated before every entry (stop must be below entry, take profit above it, and the reward/risk must meet `MIN_REWARD_RISK_RATIO`).
+   - `REQUIRE_PROTECTIVE_ORDERS`: when `True` (default) an entry is only placed if the broker accepts both the stop loss and take profit. If the bracket is rejected, the trade is skipped and an alert is sent — the bot never falls back to an unprotected market order.
+   - `SESSION_START_MESSAGE_ENABLED`: sends the “New Trading Session” welcome to Telegram on startup and on the first trading iteration of each new day, with the market-local time and current account balance. It is sent only once per startup/session.
 
 ---
 

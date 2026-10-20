@@ -91,15 +91,38 @@ MACD_FAST = _env_int("MACD_FAST", 12)
 MACD_SLOW = _env_int("MACD_SLOW", 26)
 MACD_SIGNAL = _env_int("MACD_SIGNAL", 9)
 
-POSITION_SIZE_PCT = _env_float("POSITION_SIZE_PCT", 0.05)  # fraction of cash
+# Opening volatility filter. The first minutes after the cash open are the
+# most erratic of the day, so no strategy order is submitted between the open
+# and ``OPENING_BLACKOUT_MINUTES`` later. Times are market-local, meaning
+# 09:30-10:00 New York time (EST/EDT handled automatically by the timezone).
+TIME_FILTER_ENABLED = _env_bool("TIME_FILTER_ENABLED", True)
+MARKET_OPEN_TIME = _env_str("MARKET_OPEN_TIME", "09:30")
+OPENING_BLACKOUT_MINUTES = _env_int("OPENING_BLACKOUT_MINUTES", 30)
+
+# Position sizing. Each entry is capped by *all* of these limits:
+#   * MAX_PORTFOLIO_RISK_PCT  - equity at risk if the stop loss is hit,
+#   * POSITION_SIZE_PCT       - maximum notional as a fraction of cash,
+#   * MAX_SHARES_PER_TRADE    - hard share cap (0 disables it).
+# Risk-based sizing uses the distance to the stop, so a wider stop
+# automatically buys fewer shares.
+POSITION_SIZE_PCT = _env_float("POSITION_SIZE_PCT", 0.02)  # max 2% of cash
+MAX_PORTFOLIO_RISK_PCT = _env_float("MAX_PORTFOLIO_RISK_PCT", 0.01)  # 1% of equity
+MAX_SHARES_PER_TRADE = _env_int("MAX_SHARES_PER_TRADE", 100)  # 0 = no cap
+
 STOP_LOSS_PCT = _env_float("STOP_LOSS_PCT", 0.98)          # -2%
 TAKE_PROFIT_PCT = _env_float("TAKE_PROFIT_PCT", 1.04)      # +4%
+# Entries whose take-profit distance is smaller than this multiple of the
+# stop-loss distance are rejected instead of being sent to the broker.
+MIN_REWARD_RISK_RATIO = _env_float("MIN_REWARD_RISK_RATIO", 1.0)
 
-# Order handling. Modern lumibot uses ``type=`` (e.g. "bracket"); when a
-# bracket order cannot be placed we optionally fall back to a plain market
-# order so the trade is not silently dropped.
+# Order handling. Modern lumibot uses ``type=`` (e.g. "bracket").
+# ``REQUIRE_PROTECTIVE_ORDERS`` makes every entry fail closed: if the broker
+# cannot attach a stop loss *and* a take profit, the trade is not placed.
+# A naked market fallback is therefore disabled unless protection is
+# explicitly turned off.
 ORDER_TYPE = _env_str("ORDER_TYPE", "bracket")
-BRACKET_FALLBACK_TO_MARKET = _env_bool("BRACKET_FALLBACK_TO_MARKET", True)
+REQUIRE_PROTECTIVE_ORDERS = _env_bool("REQUIRE_PROTECTIVE_ORDERS", True)
+BRACKET_FALLBACK_TO_MARKET = _env_bool("BRACKET_FALLBACK_TO_MARKET", False)
 
 # ---------------------------------------------------------------------------
 # Data / indicators
@@ -137,6 +160,8 @@ RETRY_JITTER = _env_bool("RETRY_JITTER", True)
 TELEGRAM_ENABLED = _env_bool("TELEGRAM_ENABLED", True)
 TELEGRAM_TIMEOUT = _env_float("TELEGRAM_TIMEOUT", 5)
 TELEGRAM_RETRY_ATTEMPTS = _env_int("TELEGRAM_RETRY_ATTEMPTS", 3)
+# Send one "new trading session" welcome message per bot start / trading day.
+SESSION_START_MESSAGE_ENABLED = _env_bool("SESSION_START_MESSAGE_ENABLED", True)
 
 # ---------------------------------------------------------------------------
 # End-of-day summary

@@ -20,9 +20,10 @@ import atexit
 import hashlib
 import html
 import logging
+import math
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import numpy as np # pyright: ignore[reportMissingImports]
@@ -67,13 +68,21 @@ from config import (
     MACD_SLOW,
     MACD_SIGNAL,
     POSITION_SIZE_PCT,
+    MAX_PORTFOLIO_RISK_PCT,
+    MAX_SHARES_PER_TRADE,
     STOP_LOSS_PCT,
     TAKE_PROFIT_PCT,
+    MIN_REWARD_RISK_RATIO,
+    TIME_FILTER_ENABLED,
+    MARKET_OPEN_TIME,
+    OPENING_BLACKOUT_MINUTES,
     ORDER_TYPE,
+    REQUIRE_PROTECTIVE_ORDERS,
     BRACKET_FALLBACK_TO_MARKET,
     TELEGRAM_ENABLED,
     TELEGRAM_TIMEOUT,
     TELEGRAM_RETRY_ATTEMPTS,
+    SESSION_START_MESSAGE_ENABLED,
     DAILY_SUMMARY_ENABLED,
     MARKET_TIMEZONE,
     TRADE_LEDGER_FILE,
@@ -287,6 +296,49 @@ def _start_of_trading_day(now=None):
     tz = _market_timezone()
     moment = now.astimezone(tz) if now is not None else datetime.now(tz)
     return moment.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _parse_market_open(value=MARKET_OPEN_TIME):
+    """Parse ``MARKET_OPEN_TIME`` (``HH:MM``) into ``(hour, minute)``."""
+    try:
+        parsed = datetime.strptime(str(value).strip(), "%H:%M")
+        return parsed.hour, parsed.minute
+    except (TypeError, ValueError):
+        logger.warning("Invalid MARKET_OPEN_TIME=%r; falling back to 09:30", value)
+        return 9, 30
+
+
+def opening_blackout_window(now=None):
+    """Return ``(start, end)`` of today's opening no-trade window.
+
+    Both datetimes are market-local and tz-aware. Weekends still return a
+    window; :func:`in_opening_blackout` is what decides whether it applies.
+    """
+    tz = _market_timezone()
+    moment = now.astimezone(tz) if now is not None else datetime.now(tz)
+    hour, minute = _parse_market_open()
+    start = moment.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    end = start + timedelta(minutes=max(0, OPENING_BLACKOUT_MINUTES))
+    return start, end
+
+
+def in_opening_blackout(now=None):
+    """Return ``True`` while new orders must be suppressed after the open.
+
+    The comparison is done in ``MARKET_TIMEZONE`` (default America/New_York),
+    so the window is 09:30-10:00 local time in both EST and EDT. ``now`` must
+    be tz-aware when supplied; ``None`` means "right now".
+    """
+    if not TIME_FILTER_ENABLED or OPENING_BLACKOUT_MINUTES <= 0:
+        return False
+
+    tz = _market_timezone()
+    moment = now.astimezone(tz) if now is not None else datetime.now(tz)
+    if moment.weekday() >= 5:  # Saturday/Sunday: no cash session to protect
+        return False
+
+    start, end = opening_blackout_window(moment)
+    return start <= moment < end
 
 
 def _as_float(value, default=0.0):
@@ -641,11 +693,79 @@ def round_price(value):
 
 
 def bracket_prices(price):
-    """Return ``(stop_loss, take_profit)`` on valid cent increments."""
-    return (
-        round_price(price * STOP_LOSS_PCT),
-        round_price(price * TAKE_PROFIT_PCT),
-    )
+    """Return validated ``(stop_loss, take_profit)`` for an entry at ``price``.
+
+    Both legs are rounded to a valid Alpaca increment and must sit strictly on
+    the correct side of the entry. A configuration that would produce an
+    unprotected or unbounded trade raises :class:`ValueError` so the caller
+    can skip the entry instead of sending it to the broker.
+    """
+    try:
+        entry = float(price)
+    except (TypeError, ValueError):
+        raise ValueError(f"invalid entry price {price!r}") from None
+    if not math.isfinite(entry) or entry <= 0:
+        raise ValueError(f"invalid entry price {price!r}")
+
+    entry = round_price(entry)
+    stop_loss = round_price(entry * STOP_LOSS_PCT)
+    take_profit = round_price(entry * TAKE_PROFIT_PCT)
+
+    if stop_loss >= entry:
+        raise ValueError(
+            f"stop loss {stop_loss:.2f} is not below entry {entry:.2f} "
+            f"(STOP_LOSS_PCT={STOP_LOSS_PCT})"
+        )
+    if take_profit <= entry:
+        raise ValueError(
+            f"take profit {take_profit:.2f} is not above entry {entry:.2f} "
+            f"(TAKE_PROFIT_PCT={TAKE_PROFIT_PCT})"
+        )
+
+    risk = entry - stop_loss
+    reward = take_profit - entry
+    if risk <= 0 or reward / risk < MIN_REWARD_RISK_RATIO - 1e-9:
+        raise ValueError(
+            f"reward/risk {reward / risk:.2f} is below the required "
+            f"{MIN_REWARD_RISK_RATIO:.2f} (SL={stop_loss:.2f}, "
+            f"TP={take_profit:.2f})"
+        )
+    return stop_loss, take_profit
+
+
+def position_size(price, cash, equity, stop_loss_price):
+    """Return a conservative share count that respects every risk cap.
+
+    The result is the smallest of the risk budget (equity at risk divided by
+    the per-share distance to the stop loss), the notional budget (a fraction
+    of available cash) and the hard ``MAX_SHARES_PER_TRADE`` cap. Returns 0
+    when any input is unusable, which makes the caller skip the trade.
+    """
+    try:
+        entry = float(price)
+        available = float(cash)
+        portfolio = float(equity)
+        stop = float(stop_loss_price)
+    except (TypeError, ValueError):
+        return 0
+
+    values = (entry, available, portfolio, stop)
+    if not all(math.isfinite(value) for value in values):
+        return 0
+    if entry <= 0 or available <= 0 or portfolio <= 0:
+        return 0
+
+    risk_per_share = entry - stop
+    if risk_per_share <= 0:
+        return 0
+
+    risk_quantity = portfolio * MAX_PORTFOLIO_RISK_PCT / risk_per_share
+    notional_quantity = available * POSITION_SIZE_PCT / entry
+
+    limits = [math.floor(risk_quantity), math.floor(notional_quantity)]
+    if MAX_SHARES_PER_TRADE > 0:
+        limits.append(MAX_SHARES_PER_TRADE)
+    return max(0, min(limits))
 
 
 # --------------------------------------------------------------------------
@@ -745,6 +865,27 @@ def format_fill_message(symbol, side, quantity, price):
     )
 
 
+def format_session_start_message(when, balance=None):
+    """Build the "new trading session" welcome/status message.
+
+    ``when`` is the market-local datetime of the session start and ``balance``
+    is the current account equity (or ``None`` when it cannot be fetched).
+    """
+    if isinstance(when, datetime):
+        stamp = when.strftime("%Y-%m-%d %H:%M:%S %Z").strip()
+    else:
+        stamp = str(when)
+    balance_text = _money(balance) if balance is not None else "$n/a"
+    return "\n".join(
+        [
+            "🚀 <b>بداية يوم تداول جديد | New Trading Session</b>",
+            f"• الوقت: {_esc(stamp)}",
+            f"• الرصيد الحالي (Balance): {balance_text}",
+            "• البوت شغال وجاهز لمراقبة السوق (Bot is running and active).",
+        ]
+    )
+
+
 def format_cancelled_message(symbol, side):
     """Build the Arabic confirmation for a cancelled order."""
     return "\n".join(
@@ -790,6 +931,11 @@ class MLTraderProMax(Strategy):
         self._log = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
         # Guards against producing the end-of-day report twice in one day.
         self._eod_summary_date = None
+        # Opening-volatility notice is logged once per market day, not on
+        # every iteration of the 30-minute window.
+        self._blackout_notice_date = None
+        # Ensures the welcome/status message is sent only once per session.
+        self._session_message_date = None
         # Persistent FIFO ledger used to report today's winning/losing trades.
         self._trade_ledger = DailyTradeLedger(TRADE_LEDGER_FILE)
         self._ledger_sync_date = None
@@ -799,8 +945,23 @@ class MLTraderProMax(Strategy):
             MAX_WORKERS,
             ALPACA_DATA_FEED,
         )
+        self._log.info(
+            "Risk limits: max risk/trade=%.2f%% of equity | max notional=%.2f%% "
+            "of cash | max shares=%s | SL=%.1f%% | TP=+%.1f%% | "
+            "opening filter=%s (%s +%dm)",
+            MAX_PORTFOLIO_RISK_PCT * 100.0,
+            POSITION_SIZE_PCT * 100.0,
+            MAX_SHARES_PER_TRADE if MAX_SHARES_PER_TRADE > 0 else "off",
+            (1.0 - STOP_LOSS_PCT) * 100.0,
+            (TAKE_PROFIT_PCT - 1.0) * 100.0,
+            "on" if TIME_FILTER_ENABLED else "off",
+            MARKET_OPEN_TIME,
+            OPENING_BLACKOUT_MINUTES,
+        )
         # Warm the FinBERT model in the background so the first iteration is fast.
         _alert_pool.submit(finbert_warm_up)
+        # Announce the new session as soon as the bot is initialised.
+        self._send_session_start_message()
 
     # ------------------------------------------------------------------
     # Data / indicators
@@ -963,28 +1124,99 @@ class MLTraderProMax(Strategy):
             description=f"submit_order[{symbol} {side}]",
         )
 
-    def _create_entry_order(self, symbol, quantity, price):
-        """Create the buy order, falling back from bracket to market if needed."""
-        # Alpaca requires whole-cent increments for stop/limit prices.
-        stop_loss_price, take_profit_price = bracket_prices(price)
+    def _create_entry_order(
+        self, symbol, quantity, price, stop_loss_price=None, take_profit_price=None
+    ):
+        """Create a *protected* buy order.
+
+        With ``REQUIRE_PROTECTIVE_ORDERS`` enabled (the default) the order must
+        be a bracket carrying both a stop loss and a take profit. If the broker
+        rejects it the exception propagates and the entry is skipped - the bot
+        never degrades to an unprotected market order.
+        """
+        if stop_loss_price is None or take_profit_price is None:
+            # Alpaca requires whole-cent increments for stop/limit prices.
+            stop_loss_price, take_profit_price = bracket_prices(price)
+
+        order_type = "bracket" if REQUIRE_PROTECTIVE_ORDERS else ORDER_TYPE
         try:
-            return self.create_order(
+            order = self.create_order(
                 symbol,
                 quantity,
                 "buy",
-                type=ORDER_TYPE,
+                type=order_type,
                 stop_loss_price=stop_loss_price,
                 take_profit_price=take_profit_price,
             )
         except Exception as exc:
-            if ORDER_TYPE == "bracket" and BRACKET_FALLBACK_TO_MARKET:
-                logger.warning(
-                    "[%s] bracket order rejected (%s); falling back to market order",
+            if (
+                not REQUIRE_PROTECTIVE_ORDERS
+                and ORDER_TYPE == "bracket"
+                and BRACKET_FALLBACK_TO_MARKET
+            ):
+                logger.critical(
+                    "[%s] bracket order rejected (%s); submitting an UNPROTECTED "
+                    "market order because REQUIRE_PROTECTIVE_ORDERS=false",
                     symbol,
                     exc,
                 )
                 return self.create_order(symbol, quantity, "buy", type="market")
+            if REQUIRE_PROTECTIVE_ORDERS:
+                logger.error(
+                    "[%s] could not build a protected bracket order (%s); entry "
+                    "skipped to avoid an unprotected position",
+                    symbol,
+                    exc,
+                )
             raise
+
+        self._verify_protective_order(
+            order, symbol, stop_loss_price, take_profit_price
+        )
+        return order
+
+    def _verify_protective_order(
+        self, order, symbol, stop_loss_price, take_profit_price
+    ):
+        """Fail closed when the order about to be submitted lacks protection.
+
+        Inspects the actual order object handed to the broker (not just the raw
+        request values) so a silently dropped protective leg can never create
+        a naked position.
+        """
+        if not REQUIRE_PROTECTIVE_ORDERS:
+            return
+
+        actual_stop = _as_float(getattr(order, "stop_loss_price", None), 0.0)
+        actual_tp = _as_float(getattr(order, "take_profit_price", None), 0.0)
+
+        def _abort(reason):
+            try:
+                self.cancel_order(order)
+                logger.warning("[%s] cancelled unprotected order: %s", symbol, reason)
+            except Exception as cancel_exc:
+                logger.error(
+                    "[%s] could not cancel unprotected order (%s): %s",
+                    symbol,
+                    reason,
+                    cancel_exc,
+                )
+            raise RuntimeError(f"protective order check failed: {reason}")
+
+        if actual_stop <= 0 or actual_tp <= 0:
+            _abort("stop loss and/or take profit missing from the broker order")
+        if not actual_stop < actual_tp:
+            _abort(
+                f"stop loss {actual_stop:.2f} is not below take profit {actual_tp:.2f}"
+            )
+        if (
+            abs(actual_stop - stop_loss_price) > 0.011
+            or abs(actual_tp - take_profit_price) > 0.011
+        ):
+            _abort(
+                f"broker levels SL={actual_stop:.2f}/TP={actual_tp:.2f} differ "
+                f"from requested SL={stop_loss_price:.2f}/TP={take_profit_price:.2f}"
+            )
 
     def _execute_signal(self, data):
         symbol = data["symbol"]
@@ -992,6 +1224,14 @@ class MLTraderProMax(Strategy):
         rsi = data["rsi"]
         macd_bull = data["macd_bull"]
         label = data["sentiment_label"]
+
+        # Belt-and-braces guard: even if this method is called directly, no
+        # order may leave the bot during the opening volatility window.
+        if in_opening_blackout(self._market_now()):
+            logger.info(
+                "[%s] signal ignored: opening volatility filter is active", symbol
+            )
+            return
 
         # --- BUY ---------------------------------------------------------
         if rsi < RSI_OVERSOLD and macd_bull and label == "positive":
@@ -1010,14 +1250,52 @@ class MLTraderProMax(Strategy):
             except Exception as exc:
                 logger.error("[%s] get_cash failed: %s", symbol, exc)
                 return
+            try:
+                equity = _retry(
+                    self.get_portfolio_value, description="get_portfolio_value"
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[%s] get_portfolio_value failed (%s); using cash for risk sizing",
+                    symbol,
+                    exc,
+                )
+                equity = cash
 
-            quantity = int((cash * POSITION_SIZE_PCT) / price) if price else 0
+            # Compute SL/TP before sizing: the distance to the stop determines
+            # how many shares the risk budget allows.
+            try:
+                stop_loss_price, take_profit_price = bracket_prices(price)
+            except ValueError as exc:
+                logger.error("[%s] refusing entry, invalid SL/TP: %s", symbol, exc)
+                self.telegram_send_message(
+                    format_rejected_message(symbol, "buy", exc)
+                )
+                return
+
+            quantity = position_size(
+                price, cash, equity, stop_loss_price
+            )
             if quantity <= 0:
+                self._log.info(
+                    "[%s] entry skipped: risk sizing produced 0 shares "
+                    "(price=%.2f, cash=%.2f, equity=%.2f, SL=%.2f)",
+                    symbol,
+                    price,
+                    cash,
+                    equity,
+                    stop_loss_price,
+                )
                 return
 
             try:
-                stop_loss_price, take_profit_price = bracket_prices(price)
-                order = self._create_entry_order(symbol, quantity, price)
+                order = self._create_entry_order(
+                    symbol,
+                    quantity,
+                    price,
+                    stop_loss_price,
+                    take_profit_price,
+                )
                 self._submit_with_retry(order)
                 self._log.info(
                     "BUY %s qty=%d @ %.2f (rsi=%.1f, sentiment=%s, SL=%.2f, TP=%.2f)",
@@ -1072,9 +1350,44 @@ class MLTraderProMax(Strategy):
     # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
+    def _market_now(self):
+        """Return the strategy's current market-local, tz-aware time.
+
+        Uses lumibot's ``get_datetime`` so backtests evaluate the simulated
+        bar timestamp instead of the wall clock. Falls back to the real clock
+        if the data source cannot provide a time.
+        """
+        try:
+            moment = self.get_datetime()
+        except Exception as exc:
+            logger.warning("get_datetime failed (%s); using system clock", exc)
+            moment = None
+        if moment is None:
+            return datetime.now(_market_timezone())
+        if moment.tzinfo is None:
+            return moment.replace(tzinfo=_market_timezone())
+        return moment.astimezone(_market_timezone())
+
     def on_trading_iteration(self):
         # Seed any position opened before the ledger existed (once per day).
         self._sync_trade_ledger()
+
+        now = self._market_now()
+        # First iteration of a new trading day: announce the session once.
+        self._send_session_start_message(now)
+        if in_opening_blackout(now):
+            today = now.strftime("%Y-%m-%d")
+            if self._blackout_notice_date != today:
+                start, end = opening_blackout_window(now)
+                self._log.info(
+                    "Opening volatility filter active (%s-%s): no new trades "
+                    "will be submitted during this window",
+                    start.strftime("%H:%M"),
+                    end.strftime("%H:%M"),
+                )
+                self._blackout_notice_date = today
+            return
+
         try:
             analyses = self._analyze_watchlist()
         except Exception as exc:
@@ -1121,6 +1434,9 @@ class MLTraderProMax(Strategy):
     # ------------------------------------------------------------------
     def before_market_opens(self):
         """Snapshot opening positions before any order can close them."""
+        # A process that stays up across days announces the new session here,
+        # before the first trading iteration.
+        self._send_session_start_message()
         self._sync_trade_ledger()
 
     def after_market_closes(self):
@@ -1366,6 +1682,68 @@ class MLTraderProMax(Strategy):
     # ------------------------------------------------------------------
     # Alerting (non-blocking, retried on the alert pool)
     # ------------------------------------------------------------------
+    def _current_account_balance(self):
+        """Return the current account equity, or ``None`` if unavailable.
+
+        Prefers the broker account endpoint (fresh value) and falls back to
+        lumibot's cached portfolio value so a status message is still useful
+        during a partial API outage.
+        """
+        api = getattr(getattr(self, "broker", None), "api", None)
+        if api is not None:
+            try:
+                account = _account_snapshot(api)
+                balance = account.get("equity")
+                if balance is None:
+                    balance = account.get("portfolio_value")
+                if balance is not None:
+                    return balance
+            except Exception as exc:
+                self._log.warning(
+                    "Could not fetch account balance for session message: %s", exc
+                )
+        try:
+            return _as_float(self.get_portfolio_value())
+        except Exception as exc:
+            self._log.warning(
+                "Could not read portfolio value for session message: %s", exc
+            )
+            return None
+
+    def _send_session_start_message(self, now=None):
+        """Send the welcome/status message once per bot start / trading day.
+
+        Called from ``initialize`` for an immediate startup notification and
+        from the daily lifecycle/first iteration so a process that stays up
+        across midnight announces each new trading day exactly once.
+        """
+        if not SESSION_START_MESSAGE_ENABLED:
+            return
+        if getattr(self, "is_backtesting", False):
+            # Never hit Alpaca/Telegram from a simulated run.
+            return
+        if not TELEGRAM_ENABLED or not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+            self._log.debug(
+                "Telegram is not configured; skipping session start message"
+            )
+            return
+
+        moment = now or self._market_now()
+        session_day = moment.strftime("%Y-%m-%d")
+        if self._session_message_date == session_day:
+            return
+        # Claim the day before any I/O so a duplicate call cannot send twice.
+        self._session_message_date = session_day
+
+        balance = self._current_account_balance()
+        self._log.info(
+            "New trading session started (%s); welcome message sent to Telegram "
+            "(balance=%s)",
+            moment.strftime("%Y-%m-%d %H:%M:%S %Z").strip(),
+            _money(balance) if balance is not None else "n/a",
+        )
+        self.telegram_send_message(format_session_start_message(moment, balance))
+
     def telegram_send_message(self, message, wait=False):
         """Queue a Telegram alert; ``wait=True`` blocks until it is sent.
 
