@@ -19,9 +19,13 @@ from __future__ import annotations
 import atexit
 import hashlib
 import html
+import json
 import logging
 import math
+import os
+import tempfile
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -37,10 +41,11 @@ from lumibot.brokers import Alpaca # pyright: ignore[reportMissingImports]
 # a leaner alpaca-py install cannot break importing the whole bot.
 try:  # pragma: no cover - depends on alpaca-py version
     from alpaca.trading.enums import QueryOrderStatus # pyright: ignore[reportMissingImports]
-    from alpaca.trading.requests import GetOrdersRequest # pyright: ignore[reportMissingImports]
+    from alpaca.trading.requests import GetOrdersRequest, ReplaceOrderRequest # pyright: ignore[reportMissingImports]
 except Exception:  # pragma: no cover
     QueryOrderStatus = None  # type: ignore
     GetOrdersRequest = None  # type: ignore
+    ReplaceOrderRequest = None  # type: ignore
 from lumibot.strategies.strategy import Strategy # pyright: ignore[reportMissingImports]
 from lumibot.traders import Trader # pyright: ignore[reportMissingImports]
 
@@ -68,17 +73,31 @@ from config import (
     MACD_SLOW,
     MACD_SIGNAL,
     POSITION_SIZE_PCT,
+    MAX_POSITION_NOTIONAL,
     MAX_PORTFOLIO_RISK_PCT,
     MAX_SHARES_PER_TRADE,
+    MAX_CONCURRENT_POSITIONS,
+    STOP_LOSS_MIN_PCT,
+    STOP_LOSS_MAX_PCT,
     STOP_LOSS_PCT,
     TAKE_PROFIT_PCT,
     MIN_REWARD_RISK_RATIO,
+    TRAILING_STOP_ENABLED,
+    BREAKEVEN_TRIGGER_PCT,
+    BREAKEVEN_BUFFER_PCT,
+    TRAILING_TRIGGER_PCT,
+    TRAILING_STOP_PCT,
+    DAILY_LOSS_LIMIT_ENABLED,
+    DAILY_LOSS_LIMIT_USD,
+    DAILY_LOSS_LIMIT_PCT,
+    RISK_STATE_FILE,
     TIME_FILTER_ENABLED,
     MARKET_OPEN_TIME,
     OPENING_BLACKOUT_MINUTES,
     ORDER_TYPE,
     REQUIRE_PROTECTIVE_ORDERS,
     BRACKET_FALLBACK_TO_MARKET,
+    ORDER_REGISTRATION_TIMEOUT,
     TELEGRAM_ENABLED,
     TELEGRAM_TIMEOUT,
     TELEGRAM_RETRY_ATTEMPTS,
@@ -692,13 +711,92 @@ def round_price(value):
     return max(_MIN_PRICE_TICK, round(float(value), 2))
 
 
+def clamp_stop_loss_pct(value):
+    """Clamp a stop distance (``0.0125`` == 1.25%) into the hard band.
+
+    The band is intentionally narrow (1.0%-1.5% by default): every entry must
+    be protected by a stop that is neither too tight to survive normal noise
+    nor wide enough to produce the oversized losses this guard exists to stop.
+    """
+    try:
+        low, high = sorted((float(STOP_LOSS_MIN_PCT), float(STOP_LOSS_MAX_PCT)))
+    except (TypeError, ValueError):
+        low, high = 0.010, 0.015
+    low = max(0.0, low)
+    high = max(low, high)
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return high
+    if not math.isfinite(numeric):
+        return high
+    return min(max(numeric, low), high)
+
+
+def configured_stop_loss_pct():
+    """Return ``STOP_LOSS_PCT`` as a distance, clamped to the hard band."""
+    try:
+        distance = 1.0 - float(STOP_LOSS_PCT)
+    except (TypeError, ValueError):
+        distance = STOP_LOSS_MAX_PCT
+    return clamp_stop_loss_pct(distance)
+
+
+def stop_loss_price(entry, stop_pct=None):
+    """Return a valid broker stop price for an entry at ``entry``.
+
+    The stop distance is clamped to ``[STOP_LOSS_MIN_PCT, STOP_LOSS_MAX_PCT]``
+    *after* rounding to a whole cent, so Alpaca can never receive a stop that
+    is wider than the configured maximum. Raises :class:`ValueError` when the
+    price is too small to express a valid stop (e.g. sub-dollar penny stocks).
+    """
+    try:
+        entry = float(entry)
+    except (TypeError, ValueError):
+        raise ValueError(f"invalid entry price {entry!r}") from None
+    if not math.isfinite(entry) or entry <= _MIN_PRICE_TICK:
+        raise ValueError(f"invalid entry price {entry!r}")
+
+    entry = round_price(entry)
+    pct = configured_stop_loss_pct() if stop_pct is None else clamp_stop_loss_pct(stop_pct)
+    low, high = sorted(
+        (max(0.0, float(STOP_LOSS_MIN_PCT)), max(0.0, float(STOP_LOSS_MAX_PCT)))
+    )
+
+    stop = round_price(entry * (1.0 - pct))
+    if stop >= entry:
+        stop = round_price(entry - _MIN_PRICE_TICK)
+
+    # Whole-cent rounding can move the distance slightly outside the band.
+    # Nudge it back one tick at a time; a tighter stop is always preferable to
+    # an unprotected trade.
+    for _ in range(3):
+        distance = (entry - stop) / entry
+        if distance > high + 1e-9 and stop + _MIN_PRICE_TICK < entry:
+            stop = round_price(stop + _MIN_PRICE_TICK)
+        elif distance < low - 1e-9 and stop - _MIN_PRICE_TICK > 0:
+            stop = round_price(stop - _MIN_PRICE_TICK)
+        else:
+            break
+
+    distance = (entry - stop) / entry
+    if stop <= 0 or stop >= entry or distance < low - 1e-9 or distance > high + 1e-9:
+        raise ValueError(
+            f"cannot place a {low:.2%}-{high:.2%} stop on entry {entry:.2f} "
+            f"(closest valid stop would be {stop:.2f}, "
+            f"distance {distance:.2%})"
+        )
+    return stop
+
+
 def bracket_prices(price):
     """Return validated ``(stop_loss, take_profit)`` for an entry at ``price``.
 
     Both legs are rounded to a valid Alpaca increment and must sit strictly on
-    the correct side of the entry. A configuration that would produce an
-    unprotected or unbounded trade raises :class:`ValueError` so the caller
-    can skip the entry instead of sending it to the broker.
+    the correct side of the entry. The stop loss is always inside the hard
+    1.0%-1.5% band. A configuration that would produce an unprotected or
+    unbounded trade raises :class:`ValueError` so the caller can skip the
+    entry instead of sending it to the broker.
     """
     try:
         entry = float(price)
@@ -708,7 +806,7 @@ def bracket_prices(price):
         raise ValueError(f"invalid entry price {price!r}")
 
     entry = round_price(entry)
-    stop_loss = round_price(entry * STOP_LOSS_PCT)
+    stop_loss = stop_loss_price(entry)
     take_profit = round_price(entry * TAKE_PROFIT_PCT)
 
     if stop_loss >= entry:
@@ -738,8 +836,9 @@ def position_size(price, cash, equity, stop_loss_price):
 
     The result is the smallest of the risk budget (equity at risk divided by
     the per-share distance to the stop loss), the notional budget (a fraction
-    of available cash) and the hard ``MAX_SHARES_PER_TRADE`` cap. Returns 0
-    when any input is unusable, which makes the caller skip the trade.
+    of available cash, with a hard dollar ceiling) and the hard
+    ``MAX_SHARES_PER_TRADE`` cap. Returns 0 when any input is unusable, which
+    makes the caller skip the trade.
     """
     try:
         entry = float(price)
@@ -760,12 +859,97 @@ def position_size(price, cash, equity, stop_loss_price):
         return 0
 
     risk_quantity = portfolio * MAX_PORTFOLIO_RISK_PCT / risk_per_share
-    notional_quantity = available * POSITION_SIZE_PCT / entry
+
+    notional_budget = available * POSITION_SIZE_PCT
+    if MAX_POSITION_NOTIONAL > 0:
+        notional_budget = min(notional_budget, MAX_POSITION_NOTIONAL)
+    notional_quantity = notional_budget / entry
 
     limits = [math.floor(risk_quantity), math.floor(notional_quantity)]
     if MAX_SHARES_PER_TRADE > 0:
         limits.append(MAX_SHARES_PER_TRADE)
     return max(0, min(limits))
+
+
+def trailing_stop_level(entry, current, high_water=None, existing_stop=None):
+    """Return the protective stop that should be active for a position.
+
+    The level only ever moves up. It starts at the entry stop inside the
+    1.0%-1.5% band, moves to break-even after the position has *reached* a
+    small gain, then trails the highest observed price. Triggering on the
+    high-water mark (not the current price) means a pullback from +1.5% to
+    +0.2% still keeps the trailing stop armed instead of dropping protection.
+    A returned level at or above ``current`` means the position should already
+    be closed, which lets the caller act as a software backstop when a broker
+    stop cannot be replaced.
+    """
+    try:
+        entry = float(entry)
+        current = float(current)
+    except (TypeError, ValueError):
+        return 0.0
+    if not all(math.isfinite(value) for value in (entry, current)):
+        return 0.0
+    if entry <= 0 or current <= 0:
+        return 0.0
+
+    try:
+        level = stop_loss_price(entry)
+    except ValueError:
+        return 0.0
+
+    if existing_stop is not None:
+        try:
+            existing = float(existing_stop)
+        except (TypeError, ValueError):
+            existing = 0.0
+        if math.isfinite(existing) and existing > 0:
+            level = max(level, existing)
+
+    peak = current
+    if high_water is not None:
+        try:
+            candidate = float(high_water)
+        except (TypeError, ValueError):
+            candidate = current
+        if math.isfinite(candidate) and candidate > 0:
+            peak = max(peak, candidate)
+
+    gain = (peak - entry) / entry
+    if BREAKEVEN_TRIGGER_PCT > 0 and gain >= BREAKEVEN_TRIGGER_PCT:
+        level = max(level, entry * (1.0 + max(0.0, BREAKEVEN_BUFFER_PCT)))
+    if (
+        TRAILING_TRIGGER_PCT > 0
+        and gain >= TRAILING_TRIGGER_PCT
+        and TRAILING_STOP_PCT > 0
+    ):
+        level = max(level, peak * (1.0 - max(0.0, TRAILING_STOP_PCT)))
+
+    return round_price(level)
+
+
+def effective_daily_loss_limit(balance):
+    """Return the day's USD loss threshold, or ``None`` when disabled.
+
+    The stricter of the absolute (``-$250``) and percentage (``-0.25%``)
+    limits wins, so a smaller account is protected just as tightly as a large
+    one.
+    """
+    if not DAILY_LOSS_LIMIT_ENABLED:
+        return None
+    limits = []
+    if DAILY_LOSS_LIMIT_USD > 0:
+        limits.append(float(DAILY_LOSS_LIMIT_USD))
+    if DAILY_LOSS_LIMIT_PCT > 0 and balance is not None:
+        try:
+            numeric = float(balance)
+        except (TypeError, ValueError):
+            numeric = 0.0
+        if math.isfinite(numeric) and numeric > 0:
+            limits.append(numeric * float(DAILY_LOSS_LIMIT_PCT))
+    if not limits:
+        return None
+    return min(limits)
 
 
 # --------------------------------------------------------------------------
@@ -886,6 +1070,25 @@ def format_session_start_message(when, balance=None):
     )
 
 
+def format_circuit_breaker_message(limit=None):
+    """Build the daily hard-loss (circuit breaker) alert.
+
+    ``limit`` is the effective USD threshold for the day. It defaults to the
+    configured absolute limit so the message always matches the requested
+    wording (``$250`` by default).
+    """
+    amount = DAILY_LOSS_LIMIT_USD if limit is None else limit
+    try:
+        amount = float(amount)
+    except (TypeError, ValueError):
+        amount = DAILY_LOSS_LIMIT_USD
+    return (
+        "🚨 <b>توقف حماية الحساب (Circuit Breaker)</b>: "
+        f"تجاوزت الخسارة اليومية ${amount:,.0f}. "
+        "تم إيقاف التداول اليوم لحماية باقي الرصيد."
+    )
+
+
 def format_cancelled_message(symbol, side):
     """Build the Arabic confirmation for a cancelled order."""
     return "\n".join(
@@ -939,6 +1142,19 @@ class MLTraderProMax(Strategy):
         # Persistent FIFO ledger used to report today's winning/losing trades.
         self._trade_ledger = DailyTradeLedger(TRADE_LEDGER_FILE)
         self._ledger_sync_date = None
+        # Circuit breaker / trailing-stop state. The risk state file keeps the
+        # day's opening equity and the "trading halted" flag across restarts so
+        # a reboot cannot silently re-enable trading after the daily limit.
+        self._risk_state_path = (
+            None if getattr(self, "is_backtesting", False) else RISK_STATE_FILE
+        )
+        self._risk_state = self._load_risk_state()
+        self._high_water = {}
+        self._software_stops = {}
+        self._closing_symbols = set()
+        self._risk_data_stale = False
+        self._circuit_breaker_handled = False
+        self._last_loss_warning = None
         self._log.info(
             "Strategy initialised (watchlist=%s, workers=%d, feed=%s)",
             WATCHLIST,
@@ -946,14 +1162,25 @@ class MLTraderProMax(Strategy):
             ALPACA_DATA_FEED,
         )
         self._log.info(
-            "Risk limits: max risk/trade=%.2f%% of equity | max notional=%.2f%% "
-            "of cash | max shares=%s | SL=%.1f%% | TP=+%.1f%% | "
-            "opening filter=%s (%s +%dm)",
+            "Risk limits: max %d concurrent positions | max risk/trade=%.2f%% "
+            "of equity | max notional=%.2f%% of cash (hard cap %s) | "
+            "max shares=%s | SL=%.2f%%-%.2f%% | TP=+%.2f%% | "
+            "trailing=%s | daily loss limit=%s | opening filter=%s (%s +%dm)",
+            MAX_CONCURRENT_POSITIONS,
             MAX_PORTFOLIO_RISK_PCT * 100.0,
             POSITION_SIZE_PCT * 100.0,
+            _money(MAX_POSITION_NOTIONAL) if MAX_POSITION_NOTIONAL > 0 else "off",
             MAX_SHARES_PER_TRADE if MAX_SHARES_PER_TRADE > 0 else "off",
-            (1.0 - STOP_LOSS_PCT) * 100.0,
+            STOP_LOSS_MIN_PCT * 100.0,
+            STOP_LOSS_MAX_PCT * 100.0,
             (TAKE_PROFIT_PCT - 1.0) * 100.0,
+            "on" if TRAILING_STOP_ENABLED else "off",
+            (
+                f"-{_money(DAILY_LOSS_LIMIT_USD)} or "
+                f"-{DAILY_LOSS_LIMIT_PCT:.2%} (whichever is stricter)"
+                if DAILY_LOSS_LIMIT_ENABLED
+                else "off"
+            ),
             "on" if TIME_FILTER_ENABLED else "off",
             MARKET_OPEN_TIME,
             OPENING_BLACKOUT_MINUTES,
@@ -962,6 +1189,575 @@ class MLTraderProMax(Strategy):
         _alert_pool.submit(finbert_warm_up)
         # Announce the new session as soon as the bot is initialised.
         self._send_session_start_message()
+
+    # ------------------------------------------------------------------
+    # Risk state / daily circuit breaker
+    # ------------------------------------------------------------------
+    def _load_risk_state(self):
+        """Load the persisted risk state (empty dict when unavailable).
+
+        A file that exists but cannot be parsed is treated as a tripped
+        breaker for the current day: silently forgetting a halt would re-enable
+        trading after exactly the kind of crash that most needs the protection.
+        """
+        path = getattr(self, "_risk_state_path", None)
+        if not path or not os.path.exists(path):
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            if isinstance(payload, dict):
+                return payload
+            raise ValueError("risk state is not a JSON object")
+        except Exception as exc:
+            logger.critical(
+                "Risk state %s is unreadable (%s); failing closed and halting "
+                "trading for this session",
+                path,
+                exc,
+            )
+            return {"_corrupt": True}
+
+    def _save_risk_state(self):
+        """Atomically persist the risk state so a restart cannot forget a halt."""
+        path = getattr(self, "_risk_state_path", None)
+        if not path:
+            return
+        payload = dict(getattr(self, "_risk_state", {}) or {})
+        payload["high_water"] = {
+            symbol: round(float(price), 4)
+            for symbol, price in (getattr(self, "_high_water", {}) or {}).items()
+            if _as_float(price, 0.0) > 0
+        }
+        payload["software_stops"] = {
+            symbol: round(float(price), 4)
+            for symbol, price in (getattr(self, "_software_stops", {}) or {}).items()
+            if _as_float(price, 0.0) > 0
+        }
+        directory = os.path.dirname(os.path.abspath(path)) or "."
+        tmp_path = None
+        try:
+            os.makedirs(directory, exist_ok=True)
+            fd, tmp_path = tempfile.mkstemp(
+                prefix=".risk_state.", suffix=".tmp", dir=directory
+            )
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, path)
+        except Exception as exc:
+            logger.warning("Could not save risk state %s: %s", path, exc)
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+    def _ensure_risk_day(self, now=None):
+        """Return today's risk state, resetting it on the first run of a day."""
+        moment = now or self._market_now()
+        today = moment.strftime("%Y-%m-%d")
+        state = getattr(self, "_risk_state", {})
+        if not isinstance(state, dict) or state.get("date") != today:
+            # An unreadable state file fails closed: halt this session instead
+            # of pretending the day is fresh.
+            corrupt = bool(isinstance(state, dict) and state.get("_corrupt"))
+            state = {
+                "date": today,
+                "day_start_equity": None,
+                "circuit_breaker_tripped": corrupt,
+                "tripped_at": moment.isoformat() if corrupt else None,
+                "trip_pnl": None,
+                "trip_limit": None,
+            }
+            if corrupt:
+                logger.critical(
+                    "Starting %s with a corrupt risk state: trading is halted "
+                    "until the next trading day",
+                    today,
+                )
+            self._risk_state = state
+            self._high_water = {}
+            self._software_stops = {}
+            self._closing_symbols = set()
+            self._risk_data_stale = False
+            self._circuit_breaker_handled = False
+            self._last_loss_warning = None
+            self._save_risk_state()
+        else:
+            # Restore trailing state after a restart mid-session.
+            stored_high = state.get("high_water")
+            if isinstance(stored_high, dict) and not self._high_water:
+                self._high_water = {
+                    str(symbol).upper(): _as_float(price, 0.0)
+                    for symbol, price in stored_high.items()
+                    if _as_float(price, 0.0) > 0
+                }
+            stored_stops = state.get("software_stops")
+            if isinstance(stored_stops, dict) and not self._software_stops:
+                self._software_stops = {
+                    str(symbol).upper(): _as_float(price, 0.0)
+                    for symbol, price in stored_stops.items()
+                    if _as_float(price, 0.0) > 0
+                }
+        return state
+
+    def _trading_halted(self, now=None):
+        """True when the daily circuit breaker has stopped new entries."""
+        if not DAILY_LOSS_LIMIT_ENABLED:
+            return False
+        state = self._ensure_risk_day(now)
+        return bool(state.get("circuit_breaker_tripped"))
+
+    def _position_rows(self, strict=False):
+        """Return open positions as plain dicts, with a lumibot fallback.
+
+        ``strict=True`` raises when the broker position list cannot be read.
+        Callers that must not fail open (position cap, trailing-stop
+        management) use this so a transient API error is never mistaken for
+        an empty account.
+        """
+        api = getattr(getattr(self, "broker", None), "api", None)
+        if api is not None:
+            try:
+                return _positions_snapshot(api)
+            except Exception as exc:
+                self._log.warning("Could not fetch Alpaca positions: %s", exc)
+                if strict:
+                    raise
+
+        rows = []
+        try:
+            positions = self.get_positions() or []
+        except Exception as exc:
+            self._log.warning("Could not fetch strategy positions: %s", exc)
+            if strict:
+                raise
+            return rows
+
+        for position in positions:
+            asset = getattr(position, "asset", None)
+            symbol = (
+                getattr(asset, "symbol", None)
+                or getattr(position, "symbol", None)
+                or "?"
+            )
+            qty = _as_float(
+                getattr(position, "quantity", getattr(position, "qty", None)), 0.0
+            )
+            entry = _as_float(getattr(position, "avg_entry_price", None), 0.0)
+            current = _as_float(
+                getattr(position, "current_price", None), entry or 0.0
+            )
+            unrealized = _as_float(getattr(position, "unrealized_pl", None), None)
+            if unrealized is None and entry > 0 and current > 0:
+                unrealized = (current - entry) * qty
+            rows.append(
+                {
+                    "symbol": str(symbol).upper(),
+                    "qty": qty,
+                    "avg_entry": entry,
+                    "current_price": current,
+                    "market_value": _as_float(
+                        getattr(position, "market_value", None),
+                        current * qty if current and qty else 0.0,
+                    ),
+                    "unrealized_pl": _as_float(unrealized, 0.0),
+                    "unrealized_plpc": _as_float(
+                        getattr(position, "unrealized_plpc", None),
+                        ((current - entry) / entry) if entry > 0 else 0.0,
+                    ),
+                }
+            )
+        return rows
+
+    def _daily_pnl_snapshot(self, now=None):
+        """Return realised + unrealised P/L for today and the loss threshold.
+
+        The broker's equity-versus-prior-close figure captures both realised
+        and unrealised P/L, including bracket exits that lumibot does not
+        report through ``on_filled_order``. The ledger-based figure is used as
+        a conservative cross-check, so a missing sell fill cannot hide a loss.
+        """
+        moment = now or self._market_now()
+        today = moment.strftime("%Y-%m-%d")
+
+        account = None
+        api = getattr(getattr(self, "broker", None), "api", None)
+        if api is not None:
+            try:
+                account = _account_snapshot(api)
+            except Exception as exc:
+                self._log.warning("Could not fetch account for daily P/L: %s", exc)
+
+        positions_ok = True
+        try:
+            positions = self._position_rows(strict=True)
+        except Exception as exc:
+            self._log.warning("Could not fetch positions for daily P/L: %s", exc)
+            positions = []
+            positions_ok = False
+
+        equity = _as_float(account.get("equity"), 0.0) if account else 0.0
+        if equity <= 0:
+            try:
+                equity = _as_float(self.get_portfolio_value(), 0.0)
+            except Exception as exc:
+                self._log.warning("Could not read portfolio value: %s", exc)
+                equity = 0.0
+
+        last_equity = _as_float(account.get("last_equity"), 0.0) if account else 0.0
+        state = self._ensure_risk_day(moment)
+        baseline = _as_float(state.get("day_start_equity"), 0.0)
+        baseline_fresh = False
+        if baseline <= 0:
+            if last_equity > 0:
+                baseline = last_equity
+            elif equity > 0:
+                baseline = equity
+            if baseline > 0:
+                state["day_start_equity"] = baseline
+                self._save_risk_state()
+                baseline_fresh = True
+
+        unrealized = sum(
+            _as_float(position.get("unrealized_pl"), 0.0) for position in positions
+        )
+        realized = 0.0
+        ledger_ok = True
+        ledger = getattr(self, "_trade_ledger", None)
+        if ledger is None:
+            ledger_ok = False
+        else:
+            # If the account endpoint is unavailable, import today's fills so
+            # bracket exits are not invisible to the daily P/L calculation.
+            if account is None and api is not None:
+                try:
+                    fills = _filled_orders_snapshot(
+                        api, _start_of_trading_day(moment)
+                    )
+                    if fills:
+                        ledger.reconcile_fills(fills)
+                except Exception as exc:
+                    self._log.warning(
+                        "Could not reconcile fills for daily P/L: %s", exc
+                    )
+            try:
+                realized = _as_float(ledger.stats(today).get("realized_pl"), 0.0)
+            except Exception as exc:
+                ledger_ok = False
+                self._log.warning("Could not read realised P/L: %s", exc)
+
+        ledger_total = realized + unrealized
+        broker_total = None
+        if last_equity > 0:
+            broker_total = equity - last_equity
+        elif baseline > 0 and not baseline_fresh and equity > 0:
+            # The account endpoint is unavailable but today's opening equity
+            # was recorded earlier, so equity minus that baseline is still a
+            # true daily figure.
+            broker_total = equity - baseline
+
+        # The broker's equity-versus-prior-close figure is a true *daily*
+        # number (realised + unrealised since the open). The ledger figure
+        # measures unrealised P/L since entry, so mixing the two would treat
+        # yesterday's open loss as today's loss. Use the broker figure
+        # whenever it is available and only fall back to the ledger when the
+        # account endpoint is unreachable.
+        if broker_total is not None:
+            total = broker_total
+            data_ok = True
+        else:
+            total = ledger_total
+            data_ok = positions_ok and ledger_ok
+
+        return {
+            "date": today,
+            "realized": realized,
+            "unrealized": unrealized,
+            "total": total,
+            "equity": equity,
+            "baseline": baseline,
+            "limit": effective_daily_loss_limit(baseline or equity),
+            "data_ok": data_ok,
+        }
+
+    def _check_circuit_breaker(self, now=None):
+        """Trip the daily circuit breaker when the hard loss limit is hit.
+
+        Returns ``True`` when trading is halted for the rest of the session.
+        """
+        if not DAILY_LOSS_LIMIT_ENABLED:
+            return False
+
+        moment = now or self._market_now()
+        state = self._ensure_risk_day(moment)
+
+        # A previous process already tripped the breaker today. Make sure any
+        # position left behind (crash / manual restart) is liquidated too.
+        if state.get("circuit_breaker_tripped"):
+            if not self._circuit_breaker_handled:
+                self._log.critical(
+                    "Circuit breaker already tripped for %s; flattening any "
+                    "remaining positions",
+                    state.get("date"),
+                )
+                try:
+                    self._liquidate_all_positions("circuit breaker state restored")
+                except Exception as exc:
+                    logger.error("Could not flatten positions on restore: %s", exc)
+                self._circuit_breaker_handled = True
+            else:
+                # If a liquidation was only partially filled (or a new fill
+                # slipped in), keep retrying until the account is flat — but
+                # never stack another market sell on top of one still working.
+                try:
+                    remaining = self._position_rows(strict=True)
+                    unknown = False
+                except Exception as exc:
+                    logger.warning("Could not verify flat account: %s", exc)
+                    remaining = None
+                    unknown = True
+                if unknown or remaining:
+                    count = len(remaining or ())
+                    if self._has_open_sell_orders():
+                        self._log.warning(
+                            "Circuit breaker still active with %d open position(s); "
+                            "liquidation sells are still working, waiting",
+                            count,
+                        )
+                    else:
+                        self._log.critical(
+                            "Circuit breaker still active with %d open position(s); "
+                            "retrying liquidation",
+                            count,
+                        )
+                        try:
+                            self._liquidate_all_positions(
+                                "circuit breaker follow-up"
+                            )
+                        except Exception as exc:
+                            logger.error("Follow-up liquidation failed: %s", exc)
+            return True
+
+        try:
+            snapshot = self._daily_pnl_snapshot(moment)
+        except Exception as exc:
+            logger.error("Daily P/L check failed: %s", exc, exc_info=True)
+            self._risk_data_stale = True
+            return False
+
+        if not snapshot.get("data_ok", True):
+            if not getattr(self, "_risk_data_stale", False):
+                logger.error(
+                    "Daily P/L cannot be computed (account and position data "
+                    "unavailable); blocking new entries until data is readable"
+                )
+            self._risk_data_stale = True
+            return False
+
+        if getattr(self, "_risk_data_stale", False):
+            self._log.warning(
+                "Account data is readable again; re-enabling new entries"
+            )
+            self._risk_data_stale = False
+
+        limit = snapshot.get("limit")
+        if limit is None or limit <= 0:
+            return False
+
+        total = _as_float(snapshot.get("total"), 0.0)
+        if total <= -limit + 1e-9:
+            self._trip_circuit_breaker(snapshot, moment)
+            return True
+
+        # One warning when the account enters the last quarter of its budget.
+        if total <= -0.75 * limit:
+            marker = f"{snapshot.get('date')}:{int(limit)}"
+            if getattr(self, "_last_loss_warning", None) != marker:
+                self._last_loss_warning = marker
+                self._log.warning(
+                    "Daily P/L %s is close to the %s circuit-breaker limit",
+                    _signed_money(total),
+                    _money(limit),
+                )
+        return False
+
+    def _trip_circuit_breaker(self, snapshot, now=None):
+        """Persist the halt, liquidate everything and alert Telegram."""
+        if getattr(self, "_circuit_breaker_in_progress", False):
+            return
+        self._circuit_breaker_in_progress = True
+        moment = now or self._market_now()
+        limit = _as_float(snapshot.get("limit"), DAILY_LOSS_LIMIT_USD)
+        total = _as_float(snapshot.get("total"), 0.0)
+        try:
+            state = self._ensure_risk_day(moment)
+            state.update(
+                {
+                    "circuit_breaker_tripped": True,
+                    "tripped_at": moment.isoformat(),
+                    "trip_pnl": total,
+                    "trip_limit": limit,
+                }
+            )
+            self._save_risk_state()
+            self._log.critical(
+                "CIRCUIT BREAKER: daily P/L %s breached the %s limit "
+                "(realised %s, unrealised %s). Liquidating all positions and "
+                "halting new entries for the rest of the day.",
+                _signed_money(total),
+                _money(limit),
+                _signed_money(snapshot.get("realized")),
+                _signed_money(snapshot.get("unrealized")),
+            )
+
+            try:
+                closed = self._liquidate_all_positions("daily loss limit")
+                self._log.critical(
+                    "Circuit breaker liquidation submitted for %s position(s)",
+                    closed,
+                )
+            except Exception as exc:
+                logger.error(
+                    "Circuit breaker liquidation failed: %s", exc, exc_info=True
+                )
+
+            self._circuit_breaker_handled = True
+            self.telegram_send_message(
+                format_circuit_breaker_message(limit), wait=True
+            )
+        finally:
+            self._circuit_breaker_in_progress = False
+
+    def _liquidate_all_positions(self, reason):
+        """Close every open position and cancel all protective/entry orders."""
+        api = getattr(getattr(self, "broker", None), "api", None)
+        closed = 0
+
+        if api is not None:
+            try:
+                _retry(api.cancel_orders, description="cancel_all_orders")
+            except Exception as exc:
+                self._log.warning("Could not cancel open orders: %s", exc)
+
+            try:
+                response = _retry(
+                    api.close_all_positions,
+                    cancel_orders=True,
+                    description="close_all_positions",
+                )
+                if isinstance(response, list):
+                    closed = len(response)
+                else:
+                    closed = len(self._position_rows())
+                self._log.critical(
+                    "Liquidated all positions (%s): %d position(s)", reason, closed
+                )
+                return closed
+            except Exception as exc:
+                self._log.warning(
+                    "close_all_positions failed (%s); closing one by one", exc
+                )
+
+            for position in self._position_rows():
+                symbol = position.get("symbol")
+                try:
+                    _retry(
+                        api.close_position,
+                        symbol,
+                        description=f"close_position[{symbol}]",
+                    )
+                    closed += 1
+                except Exception as exc:
+                    logger.error("[%s] close_position failed: %s", symbol, exc)
+            self._log.critical(
+                "Liquidated positions one by one (%s): %d position(s)",
+                reason,
+                closed,
+            )
+            return closed
+
+        # Fallback for a broker without the Alpaca trading client (backtests).
+        try:
+            self.cancel_open_orders()
+        except Exception as exc:
+            self._log.warning("Could not cancel open orders: %s", exc)
+
+        for position in self._position_rows():
+            symbol = position.get("symbol")
+            qty = _as_float(position.get("qty"), 0.0)
+            if qty == 0:
+                continue
+            try:
+                order = self.create_order(symbol, abs(qty), "sell", type="market")
+                self._submit_with_retry(order)
+                closed += 1
+            except Exception as exc:
+                logger.error("[%s] market liquidation failed: %s", symbol, exc)
+        self._log.critical(
+            "Liquidated positions (%s): %d position(s)", reason, closed
+        )
+        return closed
+
+    def _has_open_sell_orders(self, symbol=None, market_only=False):
+        """True when a sell order is already working (avoid duplicate sells).
+
+        Used before a follow-up liquidation or a market close so an order that
+        is still pending is not stacked on top of another one (which could flip
+        the account short once both fill). With ``market_only`` the check
+        ignores protective stop/take-profit legs, which are expected to exist
+        while a position is open.
+        """
+        target = str(symbol).upper() if symbol else None
+        api = getattr(getattr(self, "broker", None), "api", None)
+
+        orders = None
+        if (
+            api is not None
+            and GetOrdersRequest is not None
+            and QueryOrderStatus is not None
+        ):
+            try:
+                kwargs = {"status": QueryOrderStatus.OPEN}
+                if target:
+                    kwargs["symbols"] = [target]
+                request = GetOrdersRequest(**kwargs)
+                orders = _retry(
+                    api.get_orders,
+                    filter=request,
+                    description="get_open_sell_orders",
+                )
+            except Exception as exc:
+                logger.warning("Could not list open orders: %s", exc)
+
+        if orders is None:
+            try:
+                orders = self._open_orders()
+            except Exception as exc:
+                logger.warning("Could not read strategy orders: %s", exc)
+                # Unknown state: assume a sell is working so we do not add one.
+                return True
+
+        for order in orders or []:
+            side = _enum_value(getattr(order, "side", None)).lower()
+            status = _enum_value(getattr(order, "status", None)).lower()
+            if side != "sell" or status not in self._OPEN_ORDER_STATES:
+                continue
+            if market_only:
+                order_type = _enum_value(
+                    getattr(order, "type", None)
+                    or getattr(order, "order_type", None)
+                ).lower()
+                if "market" not in order_type:
+                    continue
+            order_symbol = str(
+                getattr(order, "symbol", None) or _order_symbol(order)
+            ).upper()
+            if target and order_symbol != target:
+                continue
+            return True
+        return False
 
     # ------------------------------------------------------------------
     # Data / indicators
@@ -1104,7 +1900,9 @@ class MLTraderProMax(Strategy):
 
         Before each retry we check whether a matching order already exists
         (the previous attempt may have succeeded even though the response was
-        lost); if so we treat it as done.
+        lost); if so we treat it as done. After a successful submit we wait for
+        the broker to acknowledge the order, so a rejected bracket is never
+        logged or announced as a filled BUY.
         """
 
         symbol, side, quantity = order.symbol, order.side, order.quantity
@@ -1119,26 +1917,105 @@ class MLTraderProMax(Strategy):
                 return None
             return self.submit_order(order)
 
-        return _retry(
+        result = _retry(
             _attempt,
             description=f"submit_order[{symbol} {side}]",
         )
+        if result is not None:
+            self._wait_for_order_ack(result)
+        failure = self._order_failure(result)
+        if failure:
+            raise RuntimeError(f"broker did not accept {side} {symbol}: {failure}")
+        return result
+
+    def _wait_for_order_ack(self, order):
+        """Wait (bounded) for the broker to register ``order``.
+
+        ``lumibot`` exposes an unbounded ``wait_to_be_registered``; using the
+        underlying event directly lets the trading loop give up and report a
+        rejection instead of hanging forever.
+        """
+        event = getattr(order, "_new_event", None)
+        if event is None:
+            return
+        timeout = max(0.0, float(ORDER_REGISTRATION_TIMEOUT))
+        closed_event = getattr(order, "_closed_event", None)
+
+        def _settled():
+            if event.is_set():
+                return True
+            return bool(closed_event is not None and closed_event.is_set())
+
+        try:
+            deadline = time.monotonic() + timeout
+            while not _settled():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                # Poll in short slices so a rejection (which sets only the
+                # closed event) is detected without waiting the full timeout.
+                event.wait(timeout=min(0.25, remaining))
+        except TypeError:  # very old lumibot event without a timeout argument
+            return
+        except Exception as exc:
+            logger.warning(
+                "[%s] order acknowledgement wait failed: %s",
+                _order_symbol(order),
+                exc,
+            )
+            return
+        if not _settled():
+            logger.warning(
+                "[%s] order %s was not acknowledged within %.1fs",
+                _order_symbol(order),
+                _enum_value(getattr(order, "status", None)) or "unprocessed",
+                timeout,
+            )
+
+    @staticmethod
+    def _order_failure(order):
+        """Return the broker error/status when an order was not accepted."""
+        if order is None:
+            return None
+        error = getattr(order, "_error", None) or getattr(order, "error", None)
+        if error:
+            return str(error)
+        status = _enum_value(getattr(order, "status", None)).lower()
+        # ``unprocessed`` after the acknowledgement wait means the broker never
+        # registered the order; reporting it as a BUY would be a lie.
+        if status in {
+            "error",
+            "rejected",
+            "canceled",
+            "cancelled",
+            "unprocessed",
+        }:
+            return status
+        return None
 
     def _create_entry_order(
         self, symbol, quantity, price, stop_loss_price=None, take_profit_price=None
     ):
         """Create a *protected* buy order.
 
-        With ``REQUIRE_PROTECTIVE_ORDERS`` enabled (the default) the order must
-        be a bracket carrying both a stop loss and a take profit. If the broker
-        rejects it the exception propagates and the entry is skipped - the bot
-        never degrades to an unprotected market order.
+        Every entry is submitted as a bracket carrying both the stop loss and
+        the take profit. The stop is never optional: if the broker rejects the
+        bracket the exception propagates and the entry is skipped, so the bot
+        cannot open an oversized, unprotected position. A market fallback
+        exists only behind the explicit ``BRACKET_FALLBACK_TO_MARKET`` opt-in.
         """
         if stop_loss_price is None or take_profit_price is None:
             # Alpaca requires whole-cent increments for stop/limit prices.
             stop_loss_price, take_profit_price = bracket_prices(price)
 
-        order_type = "bracket" if REQUIRE_PROTECTIVE_ORDERS else ORDER_TYPE
+        # Always bracket an entry that carries protective prices. ``ORDER_TYPE``
+        # can no longer silently downgrade a protected trade to a naked market
+        # order; that would bypass the strict stop-loss policy.
+        order_type = (
+            "bracket"
+            if (stop_loss_price is not None and take_profit_price is not None)
+            else ORDER_TYPE
+        )
         try:
             order = self.create_order(
                 symbol,
@@ -1184,9 +2061,6 @@ class MLTraderProMax(Strategy):
         request values) so a silently dropped protective leg can never create
         a naked position.
         """
-        if not REQUIRE_PROTECTIVE_ORDERS:
-            return
-
         actual_stop = _as_float(getattr(order, "stop_loss_price", None), 0.0)
         actual_tp = _as_float(getattr(order, "take_profit_price", None), 0.0)
 
@@ -1218,12 +2092,478 @@ class MLTraderProMax(Strategy):
                 f"from requested SL={stop_loss_price:.2f}/TP={take_profit_price:.2f}"
             )
 
+    # ------------------------------------------------------------------
+    # Position protection (break-even / trailing stop)
+    # ------------------------------------------------------------------
+    _OPEN_ORDER_STATES = {
+        "pending",
+        "pending_new",
+        "pending_replace",
+        "submitted",
+        "new",
+        "accepted",
+        "accepted_for_bidding",
+        "open",
+        "held",
+        "partially_filled",
+    }
+
+    def _count_exposure_slots(self):
+        """Return the number of open positions plus new-entry orders.
+
+        Pending buys for a symbol that is already held do not consume an extra
+        slot; every other pending buy does, which prevents the bot from
+        submitting a third entry before the first two fill. An unreadable
+        position list fails closed (no free slot).
+        """
+        try:
+            rows = self._position_rows(strict=True)
+        except Exception as exc:
+            logger.warning("Could not count open positions: %s", exc)
+            return MAX_CONCURRENT_POSITIONS
+        held = {
+            str(position.get("symbol") or "").upper()
+            for position in rows
+            if abs(_as_float(position.get("qty"), 0.0)) > 0
+        }
+        pending = set()
+        try:
+            for order in self._open_orders():
+                side = _enum_value(getattr(order, "side", None)).lower()
+                status = _enum_value(getattr(order, "status", None)).lower()
+                if side != "buy" or status not in self._OPEN_ORDER_STATES:
+                    continue
+                symbol = str(_order_symbol(order)).upper()
+                if symbol and symbol != "?" and symbol not in held:
+                    pending.add(symbol)
+        except Exception as exc:
+            # Unknown pending entries: fail closed instead of assuming none.
+            logger.warning("Could not count pending entry orders: %s", exc)
+            return max(MAX_CONCURRENT_POSITIONS, len(held))
+        return len(held | pending)
+
+    def _find_protective_stop(self, symbol, strict=False):
+        """Return the best open sell-stop order for ``symbol`` (or ``None``).
+
+        The result is ``{"id", "stop_price", "qty"}``. When several stops
+        exist the highest one is used, because that is the level actually
+        protecting the position. With ``strict=True`` a failure to read the
+        broker's orders raises instead of returning ``None``, so a transient
+        API error can never be mistaken for "this position has no stop" and
+        trigger a duplicate protective order.
+        """
+        symbol = str(symbol).upper()
+        api = getattr(getattr(self, "broker", None), "api", None)
+
+        orders = None
+        if api is not None and GetOrdersRequest is not None and QueryOrderStatus is not None:
+            try:
+                request = GetOrdersRequest(
+                    status=QueryOrderStatus.OPEN, symbols=[symbol]
+                )
+                orders = _retry(
+                    api.get_orders,
+                    filter=request,
+                    description=f"get_open_orders[{symbol}]",
+                )
+            except Exception as exc:
+                logger.warning("[%s] could not read open orders: %s", symbol, exc)
+                if strict:
+                    raise
+
+        if orders is None:
+            try:
+                orders = self._open_orders()
+            except Exception as exc:
+                logger.warning("[%s] could not read strategy orders: %s", symbol, exc)
+                if strict:
+                    raise
+                return None
+
+        best = self._select_stop_order(orders, symbol)
+
+        # Alpaca returns bracket child legs as separate orders, but lumibot's
+        # tracked orders are a useful second source if the API list is
+        # incomplete. Only consult them when the broker list had no stop.
+        if best is None and api is not None:
+            try:
+                best = self._select_stop_order(self._open_orders(), symbol)
+            except Exception as exc:
+                logger.debug(
+                    "[%s] strategy-order stop lookup failed: %s", symbol, exc
+                )
+        return best
+
+    def _select_stop_order(self, orders, symbol):
+        """Pick the highest open sell-stop order for ``symbol`` from ``orders``."""
+        symbol = str(symbol).upper()
+        best = None
+        for order in orders or []:
+            order_symbol = str(
+                getattr(order, "symbol", None) or _order_symbol(order)
+            ).upper()
+            if order_symbol != symbol:
+                continue
+            side = _enum_value(getattr(order, "side", None)).lower()
+            status = _enum_value(getattr(order, "status", None)).lower()
+            order_type = _enum_value(
+                getattr(order, "type", None) or getattr(order, "order_type", None)
+            ).lower()
+            stop_price = _as_float(getattr(order, "stop_price", None), 0.0)
+            if side != "sell" or "stop" not in order_type:
+                continue
+            if status not in self._OPEN_ORDER_STATES or stop_price <= 0:
+                continue
+            candidate = {
+                "id": str(
+                    getattr(order, "id", None)
+                    or getattr(order, "identifier", None)
+                    or ""
+                ),
+                "stop_price": stop_price,
+                "qty": _as_float(
+                    getattr(order, "qty", None) or getattr(order, "quantity", None),
+                    0.0,
+                ),
+            }
+            if best is None or candidate["stop_price"] > best["stop_price"]:
+                best = candidate
+        return best
+
+    def _replace_stop_order(self, stop_order, symbol, level):
+        """Move an existing broker stop up via Alpaca's replace endpoint."""
+        api = getattr(getattr(self, "broker", None), "api", None)
+        order_id = (stop_order or {}).get("id")
+        if api is None or not order_id or ReplaceOrderRequest is None:
+            return False
+        new_stop = round_price(level)
+
+        def _attempt():
+            return api.replace_order_by_id(
+                order_id, ReplaceOrderRequest(stop_price=new_stop)
+            )
+
+        try:
+            _retry(_attempt, description=f"replace_stop[{symbol}]")
+            self._log.info(
+                "[%s] trailing stop moved to %s", symbol, plain_price(new_stop)
+            )
+            return True
+        except Exception as exc:
+            self._log.warning(
+                "[%s] could not move broker stop to %s (%s); using a software "
+                "trailing stop instead",
+                symbol,
+                plain_price(new_stop),
+                exc,
+            )
+            return False
+
+    def _cancel_symbol_orders(self, symbol):
+        """Cancel every open order for ``symbol`` (frees shares for a sale).
+
+        Returns the number of cancelled orders, or ``None`` when the order list
+        could not be read or an individual cancellation failed. Callers use
+        ``None`` to avoid closing a position while a protective leg may still
+        be live (a second fill could open a short).
+        """
+        symbol = str(symbol).upper()
+        api = getattr(getattr(self, "broker", None), "api", None)
+        cancelled = 0
+        failed = 0
+
+        if api is not None and GetOrdersRequest is not None and QueryOrderStatus is not None:
+            try:
+                request = GetOrdersRequest(
+                    status=QueryOrderStatus.OPEN, symbols=[symbol]
+                )
+                orders = _retry(
+                    api.get_orders,
+                    filter=request,
+                    description=f"get_open_orders[{symbol}]",
+                )
+            except Exception as exc:
+                logger.warning("[%s] could not list orders to cancel: %s", symbol, exc)
+                return None
+            for order in orders or []:
+                order_id = getattr(order, "id", None)
+                if not order_id:
+                    continue
+                try:
+                    _retry(
+                        api.cancel_order_by_id,
+                        order_id,
+                        description=f"cancel_order[{symbol}]",
+                    )
+                    cancelled += 1
+                except Exception as exc:
+                    failed += 1
+                    logger.warning(
+                        "[%s] cancel order %s failed: %s", symbol, order_id, exc
+                    )
+            return None if failed else cancelled
+
+        try:
+            for order in self._open_orders():
+                if str(_order_symbol(order)).upper() != symbol:
+                    continue
+                try:
+                    self.cancel_order(order)
+                    cancelled += 1
+                except Exception as exc:
+                    failed += 1
+                    logger.warning("[%s] cancel order failed: %s", symbol, exc)
+        except Exception as exc:
+            logger.warning("[%s] could not list orders to cancel: %s", symbol, exc)
+            return None
+        return None if failed else cancelled
+
+    def _close_position_market(self, symbol, quantity, reason, price=None):
+        """Flatten one position at market (used by the software stop fallback)."""
+        symbol = str(symbol).upper()
+        if symbol in self._closing_symbols:
+            return False
+        self._closing_symbols.add(symbol)
+        try:
+            # A market sell that is already working must not be duplicated: two
+            # fills would flip the account short.
+            if self._has_open_sell_orders(symbol, market_only=True):
+                self._log.info(
+                    "[%s] a market exit is already working; not submitting another",
+                    symbol,
+                )
+                return False
+
+            # Verify the position before touching its protective legs: if the
+            # broker cannot be read we must not cancel the stop and leave the
+            # shares naked.
+            try:
+                rows = self._position_rows(strict=True)
+            except Exception as exc:
+                logger.warning(
+                    "[%s] could not read position (%s); keeping protective "
+                    "orders untouched",
+                    symbol,
+                    exc,
+                )
+                return False
+            live = next(
+                (
+                    position
+                    for position in rows
+                    if str(position.get("symbol") or "").upper() == symbol
+                ),
+                None,
+            )
+            if live is None:
+                self._software_stops.pop(symbol, None)
+                return False
+            qty = abs(_as_float(live.get("qty"), _as_float(quantity, 0.0)))
+            if qty <= 0:
+                return False
+
+            api = getattr(getattr(self, "broker", None), "api", None)
+            cancelled = self._cancel_symbol_orders(symbol)
+            if api is not None and cancelled is None:
+                # Without cancelling the bracket legs a market close could leave
+                # a live sell-stop behind that later opens a short position.
+                logger.warning(
+                    "[%s] could not cancel protective orders; refusing to "
+                    "close at market until the next cycle",
+                    symbol,
+                )
+                return False
+
+            # Re-read after cancelling: the broker stop may have filled while
+            # we were cancelling, and selling a stale quantity would open a
+            # short position. Falling back to the pre-cancel quantity is safe
+            # because the read succeeded moments ago.
+            try:
+                refreshed = self._position_rows(strict=True)
+            except Exception as exc:
+                logger.warning(
+                    "[%s] could not re-read position after cancelling orders "
+                    "(%s); using the last known quantity",
+                    symbol,
+                    exc,
+                )
+                refreshed = None
+            if refreshed is not None:
+                live = next(
+                    (
+                        position
+                        for position in refreshed
+                        if str(position.get("symbol") or "").upper() == symbol
+                    ),
+                    None,
+                )
+                if live is None:
+                    self._software_stops.pop(symbol, None)
+                    return False
+                fresh_qty = abs(
+                    _as_float(live.get("qty"), _as_float(quantity, 0.0))
+                )
+                if fresh_qty > 0:
+                    qty = fresh_qty
+
+            if api is not None:
+                # Server-side close uses the live quantity, so a stop that
+                # filled a moment ago cannot turn this into a short sale.
+                _retry(
+                    api.close_position,
+                    symbol,
+                    description=f"close_position[{symbol}]",
+                )
+                quantity_value = qty
+            else:
+                quantity_value = int(qty) if abs(qty - round(qty)) < 1e-9 else qty
+                order = self.create_order(
+                    symbol, quantity_value, "sell", type="market"
+                )
+                self._submit_with_retry(order)
+
+            self._software_stops.pop(symbol, None)
+            self._save_risk_state()
+            self._log.warning(
+                "[%s] closed position (%s): qty=%s",
+                symbol,
+                reason,
+                plain_quantity(quantity_value),
+            )
+            self.telegram_send_message(
+                format_sell_message(
+                    symbol,
+                    price if price is not None else live.get("current_price"),
+                    reason,
+                )
+            )
+            return True
+        except Exception as exc:
+            logger.error("[%s] market close failed: %s", symbol, exc, exc_info=True)
+            return False
+        finally:
+            self._closing_symbols.discard(symbol)
+
+    def _manage_open_positions(self, now=None):
+        """Move stops to break-even/trailing levels and enforce them.
+
+        Runs on every iteration, including the opening blackout: protection
+        must never be paused just because new entries are paused.
+        """
+        try:
+            positions = self._position_rows(strict=True)
+        except Exception as exc:
+            logger.warning(
+                "Could not read open positions (%s); skipping stop management "
+                "for this cycle and keeping existing protective state",
+                exc,
+            )
+            return
+        held = {
+            str(position.get("symbol") or "").upper()
+            for position in positions
+            if abs(_as_float(position.get("qty"), 0.0)) > 0
+        }
+        # Drop per-symbol trailing state as soon as a position is gone, so a
+        # later trade in the same symbol starts from its own entry price.
+        for stale in set(self._high_water) - held:
+            self._high_water.pop(stale, None)
+            self._software_stops.pop(stale, None)
+        if not positions:
+            return
+
+        for position in positions:
+            symbol = str(position.get("symbol") or "").upper()
+            qty = _as_float(position.get("qty"), 0.0)
+            entry = _as_float(position.get("avg_entry"), 0.0)
+            current = _as_float(position.get("current_price"), entry)
+            if not symbol or abs(qty) <= 0 or entry <= 0 or current <= 0:
+                continue
+
+            high_water = max(
+                self._high_water.get(symbol, entry), current
+            )
+            self._high_water[symbol] = high_water
+
+            stop_order = None
+            try:
+                stop_order = self._find_protective_stop(symbol, strict=True)
+            except Exception as exc:
+                logger.warning(
+                    "[%s] skipping stop management for this cycle: %s", symbol, exc
+                )
+                continue
+            broker_stop = (
+                _as_float(stop_order.get("stop_price"), 0.0) if stop_order else 0.0
+            )
+            software_stop = _as_float(self._software_stops.get(symbol), 0.0)
+            existing = max(broker_stop, software_stop)
+
+            try:
+                if TRAILING_STOP_ENABLED:
+                    desired = trailing_stop_level(
+                        entry, current, high_water, existing
+                    )
+                else:
+                    desired = max(stop_loss_price(entry), existing)
+            except Exception as exc:
+                logger.warning("[%s] could not compute trailing stop: %s", symbol, exc)
+                continue
+            if desired <= 0:
+                continue
+
+            # Price has reached the trailing level. If the broker already has
+            # that stop (or better), let it fill; otherwise close at market.
+            if current <= desired:
+                if not stop_order or desired > broker_stop + 0.005:
+                    self._close_position_market(
+                        symbol,
+                        qty,
+                        f"وصل السعر لحد حماية الأرباح ({plain_price(desired)})",
+                        current,
+                    )
+                continue
+
+            if desired <= existing + 0.005:
+                continue
+
+            moved = False
+            if stop_order:
+                moved = self._replace_stop_order(stop_order, symbol, desired)
+            # If no broker stop is visible we deliberately do not submit a
+            # second sell order (that could later fill after a take-profit and
+            # open a short). The software stop below enforces the same level.
+
+            if moved:
+                self._software_stops.pop(symbol, None)
+            else:
+                # Keep a software level that the loop enforces every minute.
+                self._software_stops[symbol] = desired
+                self._log.warning(
+                    "[%s] broker stop could not be moved; software stop armed "
+                    "at %s",
+                    symbol,
+                    plain_price(desired),
+                )
+            self._save_risk_state()
+
+    # ------------------------------------------------------------------
+    # Signal execution
+    # ------------------------------------------------------------------
     def _execute_signal(self, data):
         symbol = data["symbol"]
         price = data["price"]
         rsi = data["rsi"]
         macd_bull = data["macd_bull"]
         label = data["sentiment_label"]
+
+        # No order may leave the bot after the daily circuit breaker fired.
+        if self._trading_halted():
+            logger.info(
+                "[%s] signal ignored: daily circuit breaker has halted trading",
+                symbol,
+            )
+            return
 
         # Belt-and-braces guard: even if this method is called directly, no
         # order may leave the bot during the opening volatility window.
@@ -1235,6 +2575,22 @@ class MLTraderProMax(Strategy):
 
         # --- BUY ---------------------------------------------------------
         if rsi < RSI_OVERSOLD and macd_bull and label == "positive":
+            # If account/position data could not be read the daily loss guard
+            # cannot see the real exposure, so no new risk may be added.
+            if getattr(self, "_risk_data_stale", False):
+                logger.warning(
+                    "[%s] entry skipped: account data is stale, so the daily "
+                    "loss limit cannot be verified",
+                    symbol,
+                )
+                return
+            if self._count_exposure_slots() >= MAX_CONCURRENT_POSITIONS:
+                logger.info(
+                    "[%s] entry skipped: maximum %d concurrent positions reached",
+                    symbol,
+                    MAX_CONCURRENT_POSITIONS,
+                )
+                return
             if self._has_pending_buy(symbol):
                 return
             try:
@@ -1333,14 +2689,22 @@ class MLTraderProMax(Strategy):
                 return
 
             try:
-                order = self.create_order(
-                    symbol, pos.quantity, "sell", type="market"
+                # Cancel the bracket's stop/take-profit legs first: they hold
+                # the shares and would make a separate sell order fail.
+                closed = self._close_position_market(
+                    symbol,
+                    getattr(pos, "quantity", 0),
+                    "السعر وصل لمستويات مرتفعة",
+                    price,
                 )
-                self._submit_with_retry(order)
-                self._log.info(
-                    "SELL %s qty=%s @ %.2f (rsi=%.1f)", symbol, pos.quantity, price, rsi
-                )
-                self.telegram_send_message(format_sell_message(symbol, price))
+                if closed:
+                    self._log.info(
+                        "SELL %s qty=%s @ %.2f (rsi=%.1f)",
+                        symbol,
+                        pos.quantity,
+                        price,
+                        rsi,
+                    )
             except Exception as exc:
                 logger.error("[%s] SELL order failed: %s", symbol, exc)
                 self.telegram_send_message(
@@ -1373,8 +2737,40 @@ class MLTraderProMax(Strategy):
         self._sync_trade_ledger()
 
         now = self._market_now()
+        self._ensure_risk_day(now)
         # First iteration of a new trading day: announce the session once.
         self._send_session_start_message(now)
+
+        # Risk management runs before anything else and is never skipped by
+        # the opening blackout: protecting open positions is always allowed.
+        try:
+            halted = self._check_circuit_breaker(now)
+        except Exception as exc:
+            logger.error("Circuit breaker check failed: %s", exc, exc_info=True)
+            # Fail closed: if the daily loss cannot be measured, no new risk.
+            self._risk_data_stale = True
+            halted = False
+
+        # When the breaker is active the liquidation path owns the positions;
+        # do not let trailing-stop management race with those market sells.
+        if not halted:
+            try:
+                self._manage_open_positions(now)
+            except Exception as exc:
+                logger.error(
+                    "Position protection (trailing stop) failed: %s",
+                    exc,
+                    exc_info=True,
+                )
+
+        if halted:
+            self._log.debug(
+                "Trading halted for %s by the daily circuit breaker; no new "
+                "entries will be considered",
+                now.strftime("%Y-%m-%d"),
+            )
+            return
+
         if in_opening_blackout(now):
             today = now.strftime("%Y-%m-%d")
             if self._blackout_notice_date != today:
@@ -1401,6 +2797,17 @@ class MLTraderProMax(Strategy):
                 logger.error(
                     "[%s] execution failed: %s", data.get("symbol"), exc, exc_info=True
                 )
+
+        # Catch losses produced during this iteration immediately, rather
+        # than waiting for the next one-minute cycle.
+        try:
+            self._check_circuit_breaker(now)
+        except Exception as exc:
+            logger.error(
+                "Post-execution circuit breaker check failed: %s",
+                exc,
+                exc_info=True,
+            )
 
     def on_filled_order(self, position, order, price, quantity, multiplier):
         """lumibot lifecycle hook: confirm the fill and feed the trade ledger."""

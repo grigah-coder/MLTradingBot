@@ -50,6 +50,19 @@ def _env_list(name, default):
     return [item for item in items if item] or list(default)
 
 
+_PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _project_path(value):
+    """Resolve ``value`` against the project directory when it is relative.
+
+    Persistent risk state must not depend on the process working directory:
+    starting the bot from another folder would otherwise lose track of a
+    tripped circuit breaker.
+    """
+    return value if os.path.isabs(value) else os.path.join(_PROJECT_DIR, value)
+
+
 # ---------------------------------------------------------------------------
 # Credentials
 # ---------------------------------------------------------------------------
@@ -102,27 +115,66 @@ OPENING_BLACKOUT_MINUTES = _env_int("OPENING_BLACKOUT_MINUTES", 30)
 # Position sizing. Each entry is capped by *all* of these limits:
 #   * MAX_PORTFOLIO_RISK_PCT  - equity at risk if the stop loss is hit,
 #   * POSITION_SIZE_PCT       - maximum notional as a fraction of cash,
+#   * MAX_POSITION_NOTIONAL   - hard dollar cap per position,
 #   * MAX_SHARES_PER_TRADE    - hard share cap (0 disables it).
 # Risk-based sizing uses the distance to the stop, so a wider stop
 # automatically buys fewer shares.
-POSITION_SIZE_PCT = _env_float("POSITION_SIZE_PCT", 0.02)  # max 2% of cash
+POSITION_SIZE_PCT = _env_float("POSITION_SIZE_PCT", 0.03)  # max 3% of cash
+MAX_POSITION_NOTIONAL = _env_float("MAX_POSITION_NOTIONAL", 2500.0)  # $ cap
 MAX_PORTFOLIO_RISK_PCT = _env_float("MAX_PORTFOLIO_RISK_PCT", 0.01)  # 1% of equity
 MAX_SHARES_PER_TRADE = _env_int("MAX_SHARES_PER_TRADE", 100)  # 0 = no cap
 
-STOP_LOSS_PCT = _env_float("STOP_LOSS_PCT", 0.98)          # -2%
-TAKE_PROFIT_PCT = _env_float("TAKE_PROFIT_PCT", 1.04)      # +4%
+# Hard cap on the number of positions that may be open at the same time.
+MAX_CONCURRENT_POSITIONS = _env_int("MAX_CONCURRENT_POSITIONS", 2)
+
+# Stop loss is always attached to the entry (bracket order) and its distance
+# is clamped into this hard band, whatever STOP_LOSS_PCT says. STOP_LOSS_PCT
+# keeps the historic multiplier form (0.985 == -1.5%).
+STOP_LOSS_MIN_PCT = _env_float("STOP_LOSS_MIN_PCT", 0.010)  # 1.0% minimum
+STOP_LOSS_MAX_PCT = _env_float("STOP_LOSS_MAX_PCT", 0.015)  # 1.5% maximum
+STOP_LOSS_PCT = _env_float("STOP_LOSS_PCT", 0.985)          # -1.5%
+TAKE_PROFIT_PCT = _env_float("TAKE_PROFIT_PCT", 1.04)       # +4%
 # Entries whose take-profit distance is smaller than this multiple of the
 # stop-loss distance are rejected instead of being sent to the broker.
 MIN_REWARD_RISK_RATIO = _env_float("MIN_REWARD_RISK_RATIO", 1.0)
 
+# Trailing / break-even stop. Once a position has reached a
+# BREAKEVEN_TRIGGER_PCT gain the stop moves to entry + BREAKEVEN_BUFFER_PCT;
+# once it has reached TRAILING_TRIGGER_PCT the stop trails TRAILING_STOP_PCT
+# behind the highest price seen. The stop only ever moves up.
+TRAILING_STOP_ENABLED = _env_bool("TRAILING_STOP_ENABLED", True)
+BREAKEVEN_TRIGGER_PCT = _env_float("BREAKEVEN_TRIGGER_PCT", 0.005)  # +0.5%
+BREAKEVEN_BUFFER_PCT = _env_float("BREAKEVEN_BUFFER_PCT", 0.001)    # +0.1%
+TRAILING_TRIGGER_PCT = _env_float("TRAILING_TRIGGER_PCT", 0.010)    # +1.0%
+TRAILING_STOP_PCT = _env_float("TRAILING_STOP_PCT", 0.008)          # 0.8%
+
+# Daily hard loss limit (circuit breaker). The effective threshold is the
+# stricter of the two limits: -$250 or -0.25% of the day's opening equity.
+# When hit, every position is liquidated and no new trade is opened until the
+# next trading day.
+DAILY_LOSS_LIMIT_ENABLED = _env_bool("DAILY_LOSS_LIMIT_ENABLED", True)
+DAILY_LOSS_LIMIT_USD = _env_float("DAILY_LOSS_LIMIT_USD", 250.0)
+DAILY_LOSS_LIMIT_PCT = _env_float("DAILY_LOSS_LIMIT_PCT", 0.0025)  # 0.25%
+RISK_STATE_FILE = _project_path(
+    _env_str(
+        "RISK_STATE_FILE",
+        os.path.join(_env_str("LOG_DIR", "logs"), "risk_state.json"),
+    )
+)
+
 # Order handling. Modern lumibot uses ``type=`` (e.g. "bracket").
-# ``REQUIRE_PROTECTIVE_ORDERS`` makes every entry fail closed: if the broker
-# cannot attach a stop loss *and* a take profit, the trade is not placed.
-# A naked market fallback is therefore disabled unless protection is
-# explicitly turned off.
+# Entries are always submitted as brackets with a stop loss and take profit.
+# ``REQUIRE_PROTECTIVE_ORDERS`` is kept for backwards compatibility; the
+# verification step is also applied when it is false, so an entry can never
+# silently lose its protective legs. The only way to allow a naked market
+# order is the explicit ``BRACKET_FALLBACK_TO_MARKET`` opt-in below.
 ORDER_TYPE = _env_str("ORDER_TYPE", "bracket")
 REQUIRE_PROTECTIVE_ORDERS = _env_bool("REQUIRE_PROTECTIVE_ORDERS", True)
 BRACKET_FALLBACK_TO_MARKET = _env_bool("BRACKET_FALLBACK_TO_MARKET", False)
+# Maximum time to wait for the broker to acknowledge a submitted order. When
+# the deadline passes the order is treated as rejected, so a refused bracket
+# can never be reported as a successful BUY.
+ORDER_REGISTRATION_TIMEOUT = _env_float("ORDER_REGISTRATION_TIMEOUT", 15.0)
 
 # ---------------------------------------------------------------------------
 # Data / indicators
