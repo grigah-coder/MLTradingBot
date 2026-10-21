@@ -1,8 +1,7 @@
 """Retry / backoff helpers for flaky network calls and API rate limits.
 
-Provides :func:`call_with_retry` and the :func:`retry` decorator. Both apply
-**exponential backoff with full jitter** and understand the error types that
-matter for this bot:
+Provides :func:`call_with_retry`, which applies **exponential backoff with
+full jitter** and understands the error types that matter for this bot:
 
 * network-level failures (``ConnectionError``/``Timeout``/requests errors),
 * Alpaca ``APIError`` with a retryable HTTP status (429 rate-limit, 5xx), and
@@ -14,7 +13,6 @@ immediately so bugs surface fast instead of being masked.
 
 from __future__ import annotations
 
-import functools
 import logging
 import random
 import time
@@ -148,35 +146,3 @@ def call_with_retry(
     logger.error("%s failed after %d attempts: %s", desc, attempts, last_exc)
     assert last_exc is not None
     raise last_exc
-
-
-def retry(
-    attempts: int = 4,
-    base_delay: float = 1.0,
-    max_delay: float = 30.0,
-    backoff_factor: float = 2.0,
-    jitter: bool = True,
-    description: Optional[str] = None,
-    retry_on: Optional[Callable[[BaseException], bool]] = None,
-):
-    """Decorator form of :func:`call_with_retry`."""
-
-    def decorator(func: Callable) -> Callable:
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            return call_with_retry(
-                func,
-                *args,
-                attempts=attempts,
-                base_delay=base_delay,
-                max_delay=max_delay,
-                backoff_factor=backoff_factor,
-                jitter=jitter,
-                description=description or func.__name__,
-                retry_on=retry_on,
-                **kwargs,
-            )
-
-        return wrapper
-
-    return decorator

@@ -11,10 +11,10 @@ name and thread name (important now that symbols are analysed concurrently).
 
 Usage::
 
-    from logging_setup import configure_logging, get_logger
+    from logging_setup import configure_logging
 
     configure_logging()          # call once, early (idempotent)
-    logger = get_logger(__name__)
+    logger = logging.getLogger(__name__)
     logger.info("hello")
 """
 
@@ -130,8 +130,3 @@ def configure_logging(
 
     _configured = True
     return root
-
-
-def get_logger(name: Optional[str] = None) -> logging.Logger:
-    """Return a named logger (``mltrader`` by default)."""
-    return logging.getLogger(name if name else "mltrader")

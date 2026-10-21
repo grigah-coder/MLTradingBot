@@ -5,10 +5,9 @@ Every tunable lives here and can be overridden through environment variables
 in the trading logic.
 """
 
-import logging
 import os
 
-from dotenv import load_dotenv # pyright: ignore[reportMissingImports]
+from dotenv import load_dotenv  # pyright: ignore[reportMissingImports]
 
 load_dotenv()
 
@@ -94,8 +93,6 @@ WATCHLIST = _env_list("WATCHLIST", _DEFAULT_WATCHLIST)
 # Strategy / risk
 # ---------------------------------------------------------------------------
 SLEEPTIME = _env_str("SLEEPTIME", "1M")
-CASH_AT_RISK = _env_float("CASH_AT_RISK", 0.5)
-LIMIT_ORDER_OFFSET = _env_float("LIMIT_ORDER_OFFSET", 0.001)
 
 RSI_PERIOD = _env_int("RSI_PERIOD", 14)
 RSI_OVERSOLD = _env_float("RSI_OVERSOLD", 40)
@@ -103,6 +100,18 @@ RSI_OVERBOUGHT = _env_float("RSI_OVERBOUGHT", 70)
 MACD_FAST = _env_int("MACD_FAST", 12)
 MACD_SLOW = _env_int("MACD_SLOW", 26)
 MACD_SIGNAL = _env_int("MACD_SIGNAL", 9)
+
+# Trend confirmation. An entry is only taken when the fast/slow SMA pair and
+# the fast/slow EMA pair both point in the same direction as the signal.
+TREND_SMA_FAST = _env_int("TREND_SMA_FAST", 20)
+TREND_SMA_SLOW = _env_int("TREND_SMA_SLOW", 50)
+TREND_EMA_FAST = _env_int("TREND_EMA_FAST", 9)
+TREND_EMA_SLOW = _env_int("TREND_EMA_SLOW", 21)
+# FinBERT confidence required for the sentiment leg of an entry.
+MIN_SENTIMENT_CONFIDENCE = _env_float("MIN_SENTIMENT_CONFIDENCE", 0.55)
+# Minimum time a position must be held before a *signal* exit is allowed.
+# Stop-loss and take-profit exits are broker-side and always apply.
+MIN_HOLD_MINUTES = _env_int("MIN_HOLD_MINUTES", 15)
 
 # Opening volatility filter. The first minutes after the cash open are the
 # most erratic of the day, so no strategy order is submitted between the open
@@ -162,14 +171,9 @@ RISK_STATE_FILE = _project_path(
     )
 )
 
-# Order handling. Modern lumibot uses ``type=`` (e.g. "bracket").
-# Entries are always submitted as brackets with a stop loss and take profit.
-# ``REQUIRE_PROTECTIVE_ORDERS`` is kept for backwards compatibility; the
-# verification step is also applied when it is false, so an entry can never
-# silently lose its protective legs. The only way to allow a naked market
-# order is the explicit ``BRACKET_FALLBACK_TO_MARKET`` opt-in below.
-ORDER_TYPE = _env_str("ORDER_TYPE", "bracket")
-REQUIRE_PROTECTIVE_ORDERS = _env_bool("REQUIRE_PROTECTIVE_ORDERS", True)
+# Order handling. Entries are always submitted as brackets with a stop loss
+# and a take profit. ``BRACKET_FALLBACK_TO_MARKET`` is the only explicit opt-in
+# that permits an unprotected market entry; it is off by default.
 BRACKET_FALLBACK_TO_MARKET = _env_bool("BRACKET_FALLBACK_TO_MARKET", False)
 # Maximum time to wait for the broker to acknowledge a submitted order. When
 # the deadline passes the order is treated as rejected, so a refused bracket
@@ -179,8 +183,10 @@ ORDER_REGISTRATION_TIMEOUT = _env_float("ORDER_REGISTRATION_TIMEOUT", 15.0)
 # ---------------------------------------------------------------------------
 # Data / indicators
 # ---------------------------------------------------------------------------
-INDICATOR_LOOKBACK = _env_int("INDICATOR_LOOKBACK", 200)  # 1-minute bars
-MIN_BARS_REQUIRED = _env_int("MIN_BARS_REQUIRED", 30)
+# Indicators run on 5-minute bars so intraday noise does not create signals.
+INDICATOR_TIMEFRAME = _env_str("INDICATOR_TIMEFRAME", "5 minutes")
+INDICATOR_LOOKBACK = _env_int("INDICATOR_LOOKBACK", 200)  # 5-minute bars
+MIN_BARS_REQUIRED = _env_int("MIN_BARS_REQUIRED", 60)
 NEWS_LIMIT = _env_int("NEWS_LIMIT", 5)
 
 # ---------------------------------------------------------------------------
@@ -225,9 +231,11 @@ SESSION_START_MESSAGE_ENABLED = _env_bool("SESSION_START_MESSAGE_ENABLED", True)
 # the win/loss counts survive a restart.
 DAILY_SUMMARY_ENABLED = _env_bool("DAILY_SUMMARY_ENABLED", True)
 MARKET_TIMEZONE = _env_str("MARKET_TIMEZONE", "America/New_York")
-TRADE_LEDGER_FILE = _env_str(
-    "TRADE_LEDGER_FILE",
-    os.path.join(_env_str("LOG_DIR", "logs"), "trade_ledger.json"),
+TRADE_LEDGER_FILE = _project_path(
+    _env_str(
+        "TRADE_LEDGER_FILE",
+        os.path.join(_env_str("LOG_DIR", "logs"), "trade_ledger.json"),
+    )
 )
 
 # ---------------------------------------------------------------------------
@@ -258,8 +266,3 @@ def alpaca_config():
         "is_paper": ALPACA_PAPER,
         "FEED": ALPACA_DATA_FEED,
     }
-
-
-def resolved_log_level():
-    """Return ``LOG_LEVEL`` as a :mod:`logging` level constant."""
-    return getattr(logging, str(LOG_LEVEL).upper(), logging.INFO)

@@ -30,12 +30,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-import numpy as np # pyright: ignore[reportMissingImports]
-import pandas as pd # pyright: ignore[reportMissingModuleSource]
-import requests # pyright: ignore[reportMissingModuleSource]
-from alpaca.data.historical.news import NewsClient # pyright: ignore[reportMissingImports]
-from alpaca.data.requests import NewsRequest # pyright: ignore[reportMissingImports]
-from lumibot.brokers import Alpaca # pyright: ignore[reportMissingImports]
+import numpy as np  # pyright: ignore[reportMissingImports]
+import pandas as pd  # pyright: ignore[reportMissingModuleSource]
+import requests  # pyright: ignore[reportMissingModuleSource]
+from alpaca.data.historical.news import NewsClient  # pyright: ignore[reportMissingImports]
+from alpaca.data.requests import NewsRequest  # pyright: ignore[reportMissingImports]
+from lumibot.brokers import Alpaca  # pyright: ignore[reportMissingImports]
 
 # Trading-side alpaca-py imports (used by the end-of-day summary). Kept soft so
 # a leaner alpaca-py install cannot break importing the whole bot.
@@ -53,6 +53,7 @@ from alpaca_data_source import AlpacaIEXData
 from cache_utils import TTLCache
 from finbert_utils import estimate_sentiment, warm_up as finbert_warm_up
 from logging_setup import configure_logging
+from order_state import STOP_LOSS, TAKE_PROFIT, OrderTracker
 from retry_utils import call_with_retry
 from trade_ledger import DailyTradeLedger
 from config import (
@@ -64,6 +65,7 @@ from config import (
     MAX_WORKERS,
     ALERT_WORKERS,
     INDICATOR_LOOKBACK,
+    INDICATOR_TIMEFRAME,
     MIN_BARS_REQUIRED,
     NEWS_LIMIT,
     RSI_PERIOD,
@@ -72,6 +74,12 @@ from config import (
     MACD_FAST,
     MACD_SLOW,
     MACD_SIGNAL,
+    TREND_SMA_FAST,
+    TREND_SMA_SLOW,
+    TREND_EMA_FAST,
+    TREND_EMA_SLOW,
+    MIN_SENTIMENT_CONFIDENCE,
+    MIN_HOLD_MINUTES,
     POSITION_SIZE_PCT,
     MAX_POSITION_NOTIONAL,
     MAX_PORTFOLIO_RISK_PCT,
@@ -94,8 +102,6 @@ from config import (
     TIME_FILTER_ENABLED,
     MARKET_OPEN_TIME,
     OPENING_BLACKOUT_MINUTES,
-    ORDER_TYPE,
-    REQUIRE_PROTECTIVE_ORDERS,
     BRACKET_FALLBACK_TO_MARKET,
     ORDER_REGISTRATION_TIMEOUT,
     TELEGRAM_ENABLED,
@@ -259,11 +265,13 @@ def sentiment_for(symbol: str, headlines: str):
 
 
 def compute_indicators(df: pd.DataFrame):
-    """Compute RSI + MACD on a price DataFrame (pure / thread-safe).
+    """Compute RSI, MACD and SMA/EMA trend on a price DataFrame.
 
-    Returns ``None`` when there is not enough data.
+    The function is pure and thread-safe. Returns ``None`` when there is not
+    enough data for the slowest indicator.
     """
-    if df is None or df.empty or len(df) < MIN_BARS_REQUIRED:
+    required = max(MIN_BARS_REQUIRED, TREND_SMA_SLOW + 1, MACD_SLOW + MACD_SIGNAL)
+    if df is None or df.empty or len(df) < required:
         return None
 
     close = df["close"].astype("float64", copy=False)
@@ -289,11 +297,34 @@ def compute_indicators(df: pd.DataFrame):
     if pd.isna(last_rsi):
         return None
 
-    return {
+    # --- SMA / EMA trend -------------------------------------------------
+    sma_fast = close.rolling(TREND_SMA_FAST).mean().iloc[-1]
+    sma_slow = close.rolling(TREND_SMA_SLOW).mean().iloc[-1]
+    trend_ema_fast = close.ewm(span=TREND_EMA_FAST, adjust=False).mean().iloc[-1]
+    trend_ema_slow = close.ewm(span=TREND_EMA_SLOW, adjust=False).mean().iloc[-1]
+    last_close = float(close.iloc[-1])
+
+    values = {
         "rsi": float(last_rsi),
         "macd_bull": bool(macd.iloc[-1] > signal.iloc[-1]),
-        "close": float(close.iloc[-1]),
+        "macd_bear": bool(macd.iloc[-1] < signal.iloc[-1]),
+        "close": last_close,
+        "sma_fast": float(sma_fast) if pd.notna(sma_fast) else 0.0,
+        "sma_slow": float(sma_slow) if pd.notna(sma_slow) else 0.0,
+        "ema_fast": float(trend_ema_fast) if pd.notna(trend_ema_fast) else 0.0,
+        "ema_slow": float(trend_ema_slow) if pd.notna(trend_ema_slow) else 0.0,
     }
+    values["trend_bull"] = bool(
+        values["sma_fast"] > values["sma_slow"] > 0
+        and values["ema_fast"] > values["ema_slow"] > 0
+        and last_close > values["sma_fast"]
+    )
+    values["trend_bear"] = bool(
+        0 < values["sma_fast"] < values["sma_slow"]
+        and 0 < values["ema_fast"] < values["ema_slow"]
+        and last_close < values["sma_fast"]
+    )
+    return values
 
 
 # --------------------------------------------------------------------------
@@ -1110,6 +1141,57 @@ def format_rejected_message(symbol, side, error_message=None):
     return "\n".join(lines)
 
 
+# Order states reported by Alpaca/lumibot. Centralised so every lookup uses
+# the same definition of "still working".
+OPEN_ORDER_STATES = frozenset(
+    {
+        "pending",
+        "pending_new",
+        "pending_replace",
+        "submitted",
+        "new",
+        "accepted",
+        "accepted_for_bidding",
+        "open",
+        "held",
+        "partially_filled",
+    }
+)
+TERMINAL_ORDER_STATES = frozenset(
+    {
+        "filled",
+        "canceled",
+        "cancelled",
+        "expired",
+        "rejected",
+        "error",
+        "done_for_day",
+    }
+)
+
+
+def _order_id(order):
+    return str(
+        getattr(order, "identifier", None)
+        or getattr(order, "id", None)
+        or ""
+    )
+
+
+def _order_side(order):
+    return _enum_value(getattr(order, "side", None)).lower()
+
+
+def _order_status(order):
+    return _enum_value(getattr(order, "status", None)).lower()
+
+
+def _order_type(order):
+    return _enum_value(
+        getattr(order, "type", None) or getattr(order, "order_type", None)
+    ).lower()
+
+
 def _order_symbol(order, position=None):
     """Best-effort symbol lookup across lumibot order/position objects."""
     for source in (order, position):
@@ -1125,6 +1207,34 @@ def _order_symbol(order, position=None):
         if symbol:
             return symbol
     return "?"
+
+
+def _protective_kind(order):
+    """Return ``STOP_LOSS``/``TAKE_PROFIT`` for a live protective sell leg."""
+    if _order_side(order) != "sell":
+        return None
+    order_type = _order_type(order)
+    if "stop" in order_type:
+        return STOP_LOSS
+    if "limit" in order_type:
+        return TAKE_PROFIT
+    return None
+
+
+def _is_entry_signal(data):
+    """True only when trend, momentum, RSI and sentiment all align.
+
+    Entry requires a bullish SMA *and* EMA stack, a bullish MACD, an
+    oversold/pullback RSI and a confident positive news label. A single
+    disagreeing input keeps the bot flat.
+    """
+    return bool(
+        data.get("trend_bull")
+        and data.get("macd_bull")
+        and data.get("rsi", 100.0) <= RSI_OVERSOLD
+        and data.get("sentiment_label") == "positive"
+        and data.get("sentiment_score", 0.0) >= MIN_SENTIMENT_CONFIDENCE
+    )
 
 
 class MLTraderProMax(Strategy):
@@ -1148,13 +1258,20 @@ class MLTraderProMax(Strategy):
         self._risk_state_path = (
             None if getattr(self, "is_backtesting", False) else RISK_STATE_FILE
         )
-        self._risk_state = self._load_risk_state()
         self._high_water = {}
         self._software_stops = {}
+        self._position_opened_at = {}
+        self._risk_state = self._load_risk_state()
         self._closing_symbols = set()
         self._risk_data_stale = False
         self._circuit_breaker_handled = False
+        self._circuit_breaker_in_progress = False
         self._last_loss_warning = None
+        # Live bracket leg ids synced from Alpaca, plus the short-lived set of
+        # cancellations the bot itself requested (used to silence alerts for
+        # automated bracket/OCO replacements).
+        self._order_tracker = OrderTracker()
+        self._auto_cancels = {}
         self._log.info(
             "Strategy initialised (watchlist=%s, workers=%d, feed=%s)",
             WATCHLIST,
@@ -1234,6 +1351,13 @@ class MLTraderProMax(Strategy):
             for symbol, price in (getattr(self, "_software_stops", {}) or {}).items()
             if _as_float(price, 0.0) > 0
         }
+        payload["position_opened_at"] = {
+            symbol: stamp
+            for symbol, stamp in (
+                getattr(self, "_position_opened_at", {}) or {}
+            ).items()
+            if stamp
+        }
         directory = os.path.dirname(os.path.abspath(path)) or "."
         tmp_path = None
         try:
@@ -1280,6 +1404,7 @@ class MLTraderProMax(Strategy):
             self._high_water = {}
             self._software_stops = {}
             self._closing_symbols = set()
+            self._position_opened_at = {}
             self._risk_data_stale = False
             self._circuit_breaker_handled = False
             self._last_loss_warning = None
@@ -1287,18 +1412,25 @@ class MLTraderProMax(Strategy):
         else:
             # Restore trailing state after a restart mid-session.
             stored_high = state.get("high_water")
-            if isinstance(stored_high, dict) and not self._high_water:
+            if isinstance(stored_high, dict) and not getattr(self, "_high_water", None):
                 self._high_water = {
                     str(symbol).upper(): _as_float(price, 0.0)
                     for symbol, price in stored_high.items()
                     if _as_float(price, 0.0) > 0
                 }
             stored_stops = state.get("software_stops")
-            if isinstance(stored_stops, dict) and not self._software_stops:
+            if isinstance(stored_stops, dict) and not getattr(self, "_software_stops", None):
                 self._software_stops = {
                     str(symbol).upper(): _as_float(price, 0.0)
                     for symbol, price in stored_stops.items()
                     if _as_float(price, 0.0) > 0
+                }
+            stored_open = state.get("position_opened_at")
+            if isinstance(stored_open, dict) and not getattr(self, "_position_opened_at", None):
+                self._position_opened_at = {
+                    str(symbol).upper(): str(stamp)
+                    for symbol, stamp in stored_open.items()
+                    if stamp
                 }
         return state
 
@@ -1370,6 +1502,44 @@ class MLTraderProMax(Strategy):
                 }
             )
         return rows
+
+    def _live_position(self, symbol):
+        """Return the open broker row for ``symbol`` (or ``None``)."""
+        target = str(symbol or "").upper()
+        for position in self._position_rows(strict=True):
+            if str(position.get("symbol") or "").upper() == target:
+                return position
+        return None
+
+    def _mark_position_opened(self, symbol, when=None):
+        """Remember when a position was opened (for the hold-time guard)."""
+        symbol = str(symbol or "").upper()
+        if not symbol or self._position_opened_at.get(symbol):
+            return
+        moment = when or self._market_now()
+        self._position_opened_at[symbol] = moment.isoformat()
+
+    def _hold_time_elapsed(self, symbol, now=None):
+        """True when the 15-minute minimum hold no longer blocks a signal exit.
+
+        An unknown open time is treated as "held long enough": the guard must
+        never trap a position the bot inherited from a previous process.
+        """
+        stamp = self._position_opened_at.get(str(symbol or "").upper())
+        if not stamp:
+            return True
+        try:
+            opened_at = datetime.fromisoformat(str(stamp))
+        except (TypeError, ValueError):
+            return True
+        moment = now or self._market_now()
+        if opened_at.tzinfo is None:
+            opened_at = opened_at.replace(tzinfo=moment.tzinfo)
+        try:
+            held_minutes = (moment - opened_at).total_seconds() / 60.0
+        except TypeError:
+            return True
+        return held_minutes >= max(0, MIN_HOLD_MINUTES)
 
     def _daily_pnl_snapshot(self, now=None):
         """Return realised + unrealised P/L for today and the loss threshold.
@@ -1638,6 +1808,7 @@ class MLTraderProMax(Strategy):
         if api is not None:
             try:
                 _retry(api.cancel_orders, description="cancel_all_orders")
+                self._order_tracker.clear()
             except Exception as exc:
                 self._log.warning("Could not cancel open orders: %s", exc)
 
@@ -1654,6 +1825,7 @@ class MLTraderProMax(Strategy):
                 self._log.critical(
                     "Liquidated all positions (%s): %d position(s)", reason, closed
                 )
+                self._clear_all_position_state()
                 return closed
             except Exception as exc:
                 self._log.warning(
@@ -1676,6 +1848,7 @@ class MLTraderProMax(Strategy):
                 reason,
                 closed,
             )
+            self._clear_all_position_state()
             return closed
 
         # Fallback for a broker without the Alpaca trading client (backtests).
@@ -1698,7 +1871,16 @@ class MLTraderProMax(Strategy):
         self._log.critical(
             "Liquidated positions (%s): %d position(s)", reason, closed
         )
+        self._clear_all_position_state()
         return closed
+
+    def _clear_all_position_state(self):
+        """Forget every per-symbol protective/position value."""
+        self._high_water.clear()
+        self._software_stops.clear()
+        self._position_opened_at.clear()
+        self._order_tracker.clear()
+        self._save_risk_state()
 
     def _has_open_sell_orders(self, symbol=None, market_only=False):
         """True when a sell order is already working (avoid duplicate sells).
@@ -1710,27 +1892,7 @@ class MLTraderProMax(Strategy):
         while a position is open.
         """
         target = str(symbol).upper() if symbol else None
-        api = getattr(getattr(self, "broker", None), "api", None)
-
-        orders = None
-        if (
-            api is not None
-            and GetOrdersRequest is not None
-            and QueryOrderStatus is not None
-        ):
-            try:
-                kwargs = {"status": QueryOrderStatus.OPEN}
-                if target:
-                    kwargs["symbols"] = [target]
-                request = GetOrdersRequest(**kwargs)
-                orders = _retry(
-                    api.get_orders,
-                    filter=request,
-                    description="get_open_sell_orders",
-                )
-            except Exception as exc:
-                logger.warning("Could not list open orders: %s", exc)
-
+        orders = self._list_open_orders(target)
         if orders is None:
             try:
                 orders = self._open_orders()
@@ -1740,17 +1902,12 @@ class MLTraderProMax(Strategy):
                 return True
 
         for order in orders or []:
-            side = _enum_value(getattr(order, "side", None)).lower()
-            status = _enum_value(getattr(order, "status", None)).lower()
-            if side != "sell" or status not in self._OPEN_ORDER_STATES:
+            if _order_side(order) != "sell":
                 continue
-            if market_only:
-                order_type = _enum_value(
-                    getattr(order, "type", None)
-                    or getattr(order, "order_type", None)
-                ).lower()
-                if "market" not in order_type:
-                    continue
+            if _order_status(order) not in OPEN_ORDER_STATES:
+                continue
+            if market_only and "market" not in _order_type(order):
+                continue
             order_symbol = str(
                 getattr(order, "symbol", None) or _order_symbol(order)
             ).upper()
@@ -1763,19 +1920,19 @@ class MLTraderProMax(Strategy):
     # Data / indicators
     # ------------------------------------------------------------------
     def get_indicators(self, symbol):
-        """Return cached RSI/MACD values for ``symbol`` (or ``None``).
+        """Return cached RSI/MACD/trend values for ``symbol`` (or ``None``).
 
-        The cache is validated against the latest bar timestamp so values are
-        only reused while market data is unchanged (and within the TTL).
+        Indicators are computed on 5-minute bars to remove 1-minute noise. The
+        cache is validated against the latest bar timestamp so values are only
+        reused while the underlying market data is unchanged.
         """
         cached = _indicator_cache.get(symbol)
         try:
-            # 1-minute data: request enough bars for RSI(14) and MACD(26/9).
             bars = _retry(
                 self.get_historical_prices,
                 symbol,
                 INDICATOR_LOOKBACK,
-                "minute",
+                INDICATOR_TIMEFRAME,
                 description=f"historical_prices[{symbol}]",
             )
             df = getattr(bars, "df", None)
@@ -1794,7 +1951,12 @@ class MLTraderProMax(Strategy):
             _indicator_cache.set(symbol, {"last_ts": last_ts, "values": values})
             return values
         except Exception as exc:
-            logger.warning("Indicators failed for %s: %s", symbol, exc)
+            logger.warning(
+                "Indicators failed for %s (%s bars): %s",
+                symbol,
+                INDICATOR_TIMEFRAME,
+                exc,
+            )
             return cached["values"] if cached else None
 
     # ------------------------------------------------------------------
@@ -1831,6 +1993,8 @@ class MLTraderProMax(Strategy):
             "symbol": symbol,
             "rsi": tech["rsi"],
             "macd_bull": tech["macd_bull"],
+            "trend_bull": tech.get("trend_bull", False),
+            "trend_bear": tech.get("trend_bear", False),
             "price": tech["close"],
             "sentiment_score": score,
             "sentiment_label": label,
@@ -1863,17 +2027,156 @@ class MLTraderProMax(Strategy):
     # Order handling (main thread only)
     # ------------------------------------------------------------------
     def _open_orders(self):
-        return _retry(
-            self.get_orders, description="get_orders"
-        ) or []
+        """Return lumibot's tracked orders (fallback when Alpaca is unavailable)."""
+        return _retry(self.get_orders, description="get_orders") or []
+
+    def _list_open_orders(self, symbol=None):
+        """Return live Alpaca open orders, or ``None`` when unreadable.
+
+        Using ``None`` (instead of an empty list) lets callers distinguish
+        "the account is flat" from "the endpoint failed", which matters before
+        cancelling protective legs or purging tracked state.
+        """
+        api = getattr(getattr(self, "broker", None), "api", None)
+        if api is None or GetOrdersRequest is None or QueryOrderStatus is None:
+            return None
+        try:
+            kwargs = {"status": QueryOrderStatus.OPEN}
+            if symbol:
+                kwargs["symbols"] = [str(symbol).upper()]
+            request = GetOrdersRequest(**kwargs)
+            return list(
+                _retry(
+                    api.get_orders,
+                    filter=request,
+                    description="get_open_orders",
+                )
+                or []
+            )
+        except Exception as exc:
+            logger.warning("Could not list open orders: %s", exc)
+            return None
+
+    def _purge_stale_broker_orders(self, live_orders):
+        """Remove filled/cancelled/expired orders from lumibot's memory.
+
+        lumibot keeps bracket children in ``_unprocessed_orders`` even after
+        Alpaca has closed them and retries the cancellation on every iteration
+        ("Cannot find order ... in broker, canceling"). Dropping those ids here
+        stops the endless cancel loop and keeps the in-process state small.
+        """
+        broker = getattr(self, "broker", None)
+        if broker is None:
+            return 0
+        live_ids = {_order_id(order) for order in live_orders or [] if _order_id(order)}
+        removed = 0
+        for attribute in (
+            "_unprocessed_orders",
+            "_new_orders",
+            "_partially_filled_orders",
+        ):
+            container = getattr(broker, attribute, None)
+            if container is None:
+                continue
+            try:
+                snapshot = list(container)
+            except Exception:
+                continue
+            for order in snapshot:
+                order_id = _order_id(order)
+                status = _order_status(order)
+                stale = status in TERMINAL_ORDER_STATES or (
+                    bool(order_id)
+                    and order_id not in live_ids
+                    and (not status or status in OPEN_ORDER_STATES)
+                )
+                if not stale:
+                    continue
+                try:
+                    container.remove(order)
+                    removed += 1
+                except (ValueError, KeyError):
+                    pass
+        if removed:
+            logger.info(
+                "Purged %d closed/expired order(s) from lumibot tracking", removed
+            )
+        return removed
+
+    def _sync_order_tracker(self, live_orders):
+        """Sync tracked stop-loss/take-profit ids with Alpaca's live orders."""
+        legs = []
+        for order in live_orders or []:
+            kind = _protective_kind(order)
+            if kind is None:
+                continue
+            legs.append(
+                {
+                    "id": _order_id(order),
+                    "symbol": _order_symbol(order),
+                    "kind": kind,
+                    "status": _order_status(order),
+                }
+            )
+        stale = self._order_tracker.sync(legs)
+        if stale:
+            logger.debug(
+                "Purged %d closed bracket leg(s) from order tracker", len(stale)
+            )
+        # Auto-cancel markers are only needed until the broker callback lands.
+        cutoff = time.monotonic() - 300.0
+        for order_id, stamp in list(self._auto_cancels.items()):
+            if stamp < cutoff:
+                self._auto_cancels.pop(order_id, None)
+
+    def _refresh_order_state(self):
+        """Fetch live orders once, then sync/purge all in-memory order state."""
+        api_orders = self._list_open_orders()
+        if api_orders is None:
+            try:
+                live_orders = list(self._open_orders())
+            except Exception as exc:
+                logger.warning("Could not refresh order state: %s", exc)
+                return []
+            # The fallback list is lumibot's own view and may contain stale
+            # orders, so use it for lookups only (never for purging).
+            self._sync_order_tracker(live_orders)
+            return live_orders
+
+        self._purge_stale_broker_orders(api_orders)
+        self._sync_order_tracker(api_orders)
+        return api_orders
+
+    def _forget_broker_order(self, order):
+        """Drop one order from lumibot's tracked lists immediately."""
+        order_id = _order_id(order)
+        if order_id:
+            self._forget_broker_order_id(order_id)
+
+    def _forget_broker_order_id(self, order_id):
+        """Drop one order id from lumibot's tracked lists immediately."""
+        broker = getattr(self, "broker", None)
+        order_id = str(order_id or "").strip()
+        if broker is None or not order_id:
+            return
+        for attribute in (
+            "_unprocessed_orders",
+            "_new_orders",
+            "_partially_filled_orders",
+        ):
+            container = getattr(broker, attribute, None)
+            if container is not None:
+                try:
+                    container.remove(order_id, key="identifier")
+                except (ValueError, KeyError, AttributeError, TypeError):
+                    pass
 
     def _has_pending_buy(self, symbol) -> bool:
         try:
-            open_states = {"pending", "submitted", "new", "accepted", "open"}
             return any(
-                order.symbol == symbol
-                and order.side == "buy"
-                and order.status in open_states
+                getattr(order, "symbol", None) == symbol
+                and _order_side(order) == "buy"
+                and _order_status(order) in OPEN_ORDER_STATES
                 for order in self._open_orders()
             )
         except Exception as exc:
@@ -1980,72 +2283,51 @@ class MLTraderProMax(Strategy):
         error = getattr(order, "_error", None) or getattr(order, "error", None)
         if error:
             return str(error)
-        status = _enum_value(getattr(order, "status", None)).lower()
+        status = _order_status(order)
         # ``unprocessed`` after the acknowledgement wait means the broker never
         # registered the order; reporting it as a BUY would be a lie.
-        if status in {
-            "error",
-            "rejected",
-            "canceled",
-            "cancelled",
-            "unprocessed",
-        }:
+        if status in {"error", "rejected", "canceled", "cancelled", "unprocessed"}:
             return status
         return None
 
     def _create_entry_order(
         self, symbol, quantity, price, stop_loss_price=None, take_profit_price=None
     ):
-        """Create a *protected* buy order.
+        """Create a *protected* bracket buy order.
 
-        Every entry is submitted as a bracket carrying both the stop loss and
-        the take profit. The stop is never optional: if the broker rejects the
-        bracket the exception propagates and the entry is skipped, so the bot
-        cannot open an oversized, unprotected position. A market fallback
-        exists only behind the explicit ``BRACKET_FALLBACK_TO_MARKET`` opt-in.
+        Both legs are mandatory. If the broker rejects the bracket the entry is
+        skipped, unless the explicit ``BRACKET_FALLBACK_TO_MARKET`` opt-in is
+        enabled (which logs a critical warning before sending a naked order).
         """
         if stop_loss_price is None or take_profit_price is None:
             # Alpaca requires whole-cent increments for stop/limit prices.
             stop_loss_price, take_profit_price = bracket_prices(price)
 
-        # Always bracket an entry that carries protective prices. ``ORDER_TYPE``
-        # can no longer silently downgrade a protected trade to a naked market
-        # order; that would bypass the strict stop-loss policy.
-        order_type = (
-            "bracket"
-            if (stop_loss_price is not None and take_profit_price is not None)
-            else ORDER_TYPE
-        )
         try:
             order = self.create_order(
                 symbol,
                 quantity,
                 "buy",
-                type=order_type,
+                type="bracket",
                 stop_loss_price=stop_loss_price,
                 take_profit_price=take_profit_price,
             )
         except Exception as exc:
-            if (
-                not REQUIRE_PROTECTIVE_ORDERS
-                and ORDER_TYPE == "bracket"
-                and BRACKET_FALLBACK_TO_MARKET
-            ):
-                logger.critical(
-                    "[%s] bracket order rejected (%s); submitting an UNPROTECTED "
-                    "market order because REQUIRE_PROTECTIVE_ORDERS=false",
-                    symbol,
-                    exc,
-                )
-                return self.create_order(symbol, quantity, "buy", type="market")
-            if REQUIRE_PROTECTIVE_ORDERS:
+            if not BRACKET_FALLBACK_TO_MARKET:
                 logger.error(
                     "[%s] could not build a protected bracket order (%s); entry "
                     "skipped to avoid an unprotected position",
                     symbol,
                     exc,
                 )
-            raise
+                raise
+            logger.critical(
+                "[%s] bracket rejected (%s); submitting an UNPROTECTED market "
+                "order because BRACKET_FALLBACK_TO_MARKET=true",
+                symbol,
+                exc,
+            )
+            return self.create_order(symbol, quantity, "buy", type="market")
 
         self._verify_protective_order(
             order, symbol, stop_loss_price, take_profit_price
@@ -2066,7 +2348,8 @@ class MLTraderProMax(Strategy):
 
         def _abort(reason):
             try:
-                self.cancel_order(order)
+                self._cancel_order(order, symbol)
+                self._order_tracker.forget(_order_id(order))
                 logger.warning("[%s] cancelled unprotected order: %s", symbol, reason)
             except Exception as cancel_exc:
                 logger.error(
@@ -2095,19 +2378,6 @@ class MLTraderProMax(Strategy):
     # ------------------------------------------------------------------
     # Position protection (break-even / trailing stop)
     # ------------------------------------------------------------------
-    _OPEN_ORDER_STATES = {
-        "pending",
-        "pending_new",
-        "pending_replace",
-        "submitted",
-        "new",
-        "accepted",
-        "accepted_for_bidding",
-        "open",
-        "held",
-        "partially_filled",
-    }
-
     def _count_exposure_slots(self):
         """Return the number of open positions plus new-entry orders.
 
@@ -2129,9 +2399,9 @@ class MLTraderProMax(Strategy):
         pending = set()
         try:
             for order in self._open_orders():
-                side = _enum_value(getattr(order, "side", None)).lower()
-                status = _enum_value(getattr(order, "status", None)).lower()
-                if side != "buy" or status not in self._OPEN_ORDER_STATES:
+                if _order_side(order) != "buy":
+                    continue
+                if _order_status(order) not in OPEN_ORDER_STATES:
                     continue
                 symbol = str(_order_symbol(order)).upper()
                 if symbol and symbol != "?" and symbol not in held:
@@ -2142,57 +2412,29 @@ class MLTraderProMax(Strategy):
             return max(MAX_CONCURRENT_POSITIONS, len(held))
         return len(held | pending)
 
-    def _find_protective_stop(self, symbol, strict=False):
+    def _find_protective_stop(self, symbol, orders=None, strict=False):
         """Return the best open sell-stop order for ``symbol`` (or ``None``).
 
         The result is ``{"id", "stop_price", "qty"}``. When several stops
         exist the highest one is used, because that is the level actually
-        protecting the position. With ``strict=True`` a failure to read the
-        broker's orders raises instead of returning ``None``, so a transient
-        API error can never be mistaken for "this position has no stop" and
-        trigger a duplicate protective order.
+        protecting the position. Callers normally pass the live order snapshot
+        fetched earlier in the cycle. With ``strict=True`` a read failure raises
+        instead of looking like "this position has no stop".
         """
         symbol = str(symbol).upper()
-        api = getattr(getattr(self, "broker", None), "api", None)
-
-        orders = None
-        if api is not None and GetOrdersRequest is not None and QueryOrderStatus is not None:
-            try:
-                request = GetOrdersRequest(
-                    status=QueryOrderStatus.OPEN, symbols=[symbol]
-                )
-                orders = _retry(
-                    api.get_orders,
-                    filter=request,
-                    description=f"get_open_orders[{symbol}]",
-                )
-            except Exception as exc:
-                logger.warning("[%s] could not read open orders: %s", symbol, exc)
-                if strict:
-                    raise
-
         if orders is None:
-            try:
-                orders = self._open_orders()
-            except Exception as exc:
-                logger.warning("[%s] could not read strategy orders: %s", symbol, exc)
-                if strict:
-                    raise
-                return None
-
-        best = self._select_stop_order(orders, symbol)
-
-        # Alpaca returns bracket child legs as separate orders, but lumibot's
-        # tracked orders are a useful second source if the API list is
-        # incomplete. Only consult them when the broker list had no stop.
-        if best is None and api is not None:
-            try:
-                best = self._select_stop_order(self._open_orders(), symbol)
-            except Exception as exc:
-                logger.debug(
-                    "[%s] strategy-order stop lookup failed: %s", symbol, exc
-                )
-        return best
+            orders = self._list_open_orders(symbol)
+            if orders is None:
+                try:
+                    orders = self._open_orders()
+                except Exception as exc:
+                    logger.warning(
+                        "[%s] could not read strategy orders: %s", symbol, exc
+                    )
+                    if strict:
+                        raise
+                    return None
+        return self._select_stop_order(orders, symbol)
 
     def _select_stop_order(self, orders, symbol):
         """Pick the highest open sell-stop order for ``symbol`` from ``orders``."""
@@ -2204,22 +2446,15 @@ class MLTraderProMax(Strategy):
             ).upper()
             if order_symbol != symbol:
                 continue
-            side = _enum_value(getattr(order, "side", None)).lower()
-            status = _enum_value(getattr(order, "status", None)).lower()
-            order_type = _enum_value(
-                getattr(order, "type", None) or getattr(order, "order_type", None)
-            ).lower()
-            stop_price = _as_float(getattr(order, "stop_price", None), 0.0)
-            if side != "sell" or "stop" not in order_type:
+            if _order_side(order) != "sell" or "stop" not in _order_type(order):
                 continue
-            if status not in self._OPEN_ORDER_STATES or stop_price <= 0:
+            if _order_status(order) not in OPEN_ORDER_STATES:
+                continue
+            stop_price = _as_float(getattr(order, "stop_price", None), 0.0)
+            if stop_price <= 0:
                 continue
             candidate = {
-                "id": str(
-                    getattr(order, "id", None)
-                    or getattr(order, "identifier", None)
-                    or ""
-                ),
+                "id": _order_id(order),
                 "stop_price": stop_price,
                 "qty": _as_float(
                     getattr(order, "qty", None) or getattr(order, "quantity", None),
@@ -2231,7 +2466,12 @@ class MLTraderProMax(Strategy):
         return best
 
     def _replace_stop_order(self, stop_order, symbol, level):
-        """Move an existing broker stop up via Alpaca's replace endpoint."""
+        """Move an existing broker stop up via Alpaca's replace endpoint.
+
+        Alpaca answers a replace with a **new order id**. The old id is purged
+        and the tracker immediately points at the replacement, so the next
+        cancel/replace cannot target a closed order.
+        """
         api = getattr(getattr(self, "broker", None), "api", None)
         order_id = (stop_order or {}).get("id")
         if api is None or not order_id or ReplaceOrderRequest is None:
@@ -2244,7 +2484,16 @@ class MLTraderProMax(Strategy):
             )
 
         try:
-            _retry(_attempt, description=f"replace_stop[{symbol}]")
+            response = _retry(_attempt, description=f"replace_stop[{symbol}]")
+            self._order_tracker.forget(order_id)
+            # lumibot still tracks the pre-replace id; drop it now so its order
+            # sync cannot try to cancel an id Alpaca has already closed.
+            self._forget_broker_order_id(order_id)
+            new_id = _order_id(response)
+            if new_id:
+                self._order_tracker.register(
+                    new_id, symbol, STOP_LOSS, _order_status(response)
+                )
             self._log.info(
                 "[%s] trailing stop moved to %s", symbol, plain_price(new_stop)
             )
@@ -2259,64 +2508,102 @@ class MLTraderProMax(Strategy):
             )
             return False
 
+    @staticmethod
+    def _order_is_gone(exc):
+        """True when a cancel failed because the order is already closed."""
+        code = getattr(exc, "status_code", None)
+        if code is None:
+            code = getattr(getattr(exc, "response", None), "status_code", None)
+        if code in {404, 422}:
+            return True
+        text = str(exc).lower()
+        return any(
+            token in text
+            for token in (
+                "not found",
+                "already cancel",
+                "not open",
+                "is filled",
+                "filled",
+                "expired",
+            )
+        )
+
+    def _cancel_order(self, order, symbol):
+        """Cancel one order and purge its id from every in-memory index."""
+        order_id = _order_id(order)
+        if not order_id:
+            return False
+        api = getattr(getattr(self, "broker", None), "api", None)
+        # Remember that this cancellation was ours so the broker callback does
+        # not send a user-facing "order cancelled" alert for a bracket rollover.
+        self._auto_cancels[order_id] = time.monotonic()
+        self._order_tracker.forget(order_id)
+        self._forget_broker_order(order)
+        try:
+            if api is not None:
+                _retry(
+                    api.cancel_order_by_id,
+                    order_id,
+                    description=f"cancel_order[{symbol}]",
+                )
+            else:
+                self.cancel_order(order)
+            return True
+        except Exception as exc:
+            if self._order_is_gone(exc):
+                logger.debug(
+                    "[%s] order %s was already closed; purged from tracking",
+                    symbol,
+                    order_id,
+                )
+                return True
+            # The order may still be live; do not silence a later genuine
+            # cancellation alert for it.
+            self._auto_cancels.pop(order_id, None)
+            logger.warning("[%s] cancel order %s failed: %s", symbol, order_id, exc)
+            return False
+
     def _cancel_symbol_orders(self, symbol):
         """Cancel every open order for ``symbol`` (frees shares for a sale).
 
         Returns the number of cancelled orders, or ``None`` when the order list
         could not be read or an individual cancellation failed. Callers use
         ``None`` to avoid closing a position while a protective leg may still
-        be live (a second fill could open a short).
+        be live (a second fill could open a short). Closed/expired ids are
+        purged immediately and are not retried.
         """
         symbol = str(symbol).upper()
-        api = getattr(getattr(self, "broker", None), "api", None)
+        orders = self._list_open_orders(symbol)
+        if orders is None:
+            try:
+                orders = [
+                    order
+                    for order in self._open_orders()
+                    if str(_order_symbol(order)).upper() == symbol
+                ]
+            except Exception as exc:
+                logger.warning(
+                    "[%s] could not list orders to cancel: %s", symbol, exc
+                )
+                return None
+
         cancelled = 0
         failed = 0
-
-        if api is not None and GetOrdersRequest is not None and QueryOrderStatus is not None:
-            try:
-                request = GetOrdersRequest(
-                    status=QueryOrderStatus.OPEN, symbols=[symbol]
-                )
-                orders = _retry(
-                    api.get_orders,
-                    filter=request,
-                    description=f"get_open_orders[{symbol}]",
-                )
-            except Exception as exc:
-                logger.warning("[%s] could not list orders to cancel: %s", symbol, exc)
-                return None
-            for order in orders or []:
-                order_id = getattr(order, "id", None)
-                if not order_id:
-                    continue
-                try:
-                    _retry(
-                        api.cancel_order_by_id,
-                        order_id,
-                        description=f"cancel_order[{symbol}]",
-                    )
-                    cancelled += 1
-                except Exception as exc:
-                    failed += 1
-                    logger.warning(
-                        "[%s] cancel order %s failed: %s", symbol, order_id, exc
-                    )
-            return None if failed else cancelled
-
-        try:
-            for order in self._open_orders():
-                if str(_order_symbol(order)).upper() != symbol:
-                    continue
-                try:
-                    self.cancel_order(order)
-                    cancelled += 1
-                except Exception as exc:
-                    failed += 1
-                    logger.warning("[%s] cancel order failed: %s", symbol, exc)
-        except Exception as exc:
-            logger.warning("[%s] could not list orders to cancel: %s", symbol, exc)
-            return None
+        for order in orders or []:
+            if self._cancel_order(order, symbol):
+                cancelled += 1
+            else:
+                failed += 1
         return None if failed else cancelled
+
+    def _clear_position_state(self, symbol):
+        """Forget every per-symbol value once the position is flat."""
+        symbol = str(symbol or "").upper()
+        self._high_water.pop(symbol, None)
+        self._software_stops.pop(symbol, None)
+        self._position_opened_at.pop(symbol, None)
+        self._order_tracker.forget_symbol(symbol)
 
     def _close_position_market(self, symbol, quantity, reason, price=None):
         """Flatten one position at market (used by the software stop fallback)."""
@@ -2325,8 +2612,7 @@ class MLTraderProMax(Strategy):
             return False
         self._closing_symbols.add(symbol)
         try:
-            # A market sell that is already working must not be duplicated: two
-            # fills would flip the account short.
+            # Two market sells would flip the account short once both fill.
             if self._has_open_sell_orders(symbol, market_only=True):
                 self._log.info(
                     "[%s] a market exit is already working; not submitting another",
@@ -2334,11 +2620,10 @@ class MLTraderProMax(Strategy):
                 )
                 return False
 
-            # Verify the position before touching its protective legs: if the
-            # broker cannot be read we must not cancel the stop and leave the
-            # shares naked.
+            # Never cancel the protective legs without confirming the position:
+            # a read failure must not leave the shares naked.
             try:
-                rows = self._position_rows(strict=True)
+                live = self._live_position(symbol)
             except Exception as exc:
                 logger.warning(
                     "[%s] could not read position (%s); keeping protective "
@@ -2347,17 +2632,10 @@ class MLTraderProMax(Strategy):
                     exc,
                 )
                 return False
-            live = next(
-                (
-                    position
-                    for position in rows
-                    if str(position.get("symbol") or "").upper() == symbol
-                ),
-                None,
-            )
             if live is None:
-                self._software_stops.pop(symbol, None)
+                self._clear_position_state(symbol)
                 return False
+
             qty = abs(_as_float(live.get("qty"), _as_float(quantity, 0.0)))
             if qty <= 0:
                 return False
@@ -2365,8 +2643,7 @@ class MLTraderProMax(Strategy):
             api = getattr(getattr(self, "broker", None), "api", None)
             cancelled = self._cancel_symbol_orders(symbol)
             if api is not None and cancelled is None:
-                # Without cancelling the bracket legs a market close could leave
-                # a live sell-stop behind that later opens a short position.
+                # A live sell-stop left behind could later open a short.
                 logger.warning(
                     "[%s] could not cancel protective orders; refusing to "
                     "close at market until the next cycle",
@@ -2374,41 +2651,24 @@ class MLTraderProMax(Strategy):
                 )
                 return False
 
-            # Re-read after cancelling: the broker stop may have filled while
-            # we were cancelling, and selling a stale quantity would open a
-            # short position. Falling back to the pre-cancel quantity is safe
-            # because the read succeeded moments ago.
+            # Re-read after cancelling: the stop may have filled meanwhile, and
+            # selling a stale quantity would open a short position.
             try:
-                refreshed = self._position_rows(strict=True)
+                refreshed = self._live_position(symbol)
             except Exception as exc:
                 logger.warning(
-                    "[%s] could not re-read position after cancelling orders "
-                    "(%s); using the last known quantity",
+                    "[%s] could not re-read position (%s); using the last known "
+                    "quantity",
                     symbol,
                     exc,
                 )
-                refreshed = None
-            if refreshed is not None:
-                live = next(
-                    (
-                        position
-                        for position in refreshed
-                        if str(position.get("symbol") or "").upper() == symbol
-                    ),
-                    None,
-                )
-                if live is None:
-                    self._software_stops.pop(symbol, None)
-                    return False
-                fresh_qty = abs(
-                    _as_float(live.get("qty"), _as_float(quantity, 0.0))
-                )
-                if fresh_qty > 0:
-                    qty = fresh_qty
+                refreshed = live
+            if refreshed is None:
+                self._clear_position_state(symbol)
+                return False
+            qty = abs(_as_float(refreshed.get("qty"), qty)) or qty
 
             if api is not None:
-                # Server-side close uses the live quantity, so a stop that
-                # filled a moment ago cannot turn this into a short sale.
                 _retry(
                     api.close_position,
                     symbol,
@@ -2422,7 +2682,7 @@ class MLTraderProMax(Strategy):
                 )
                 self._submit_with_retry(order)
 
-            self._software_stops.pop(symbol, None)
+            self._clear_position_state(symbol)
             self._save_risk_state()
             self._log.warning(
                 "[%s] closed position (%s): qty=%s",
@@ -2433,7 +2693,9 @@ class MLTraderProMax(Strategy):
             self.telegram_send_message(
                 format_sell_message(
                     symbol,
-                    price if price is not None else live.get("current_price"),
+                    price
+                    if price is not None
+                    else refreshed.get("current_price"),
                     reason,
                 )
             )
@@ -2444,7 +2706,7 @@ class MLTraderProMax(Strategy):
         finally:
             self._closing_symbols.discard(symbol)
 
-    def _manage_open_positions(self, now=None):
+    def _manage_open_positions(self, now=None, orders=None):
         """Move stops to break-even/trailing levels and enforce them.
 
         Runs on every iteration, including the opening blackout: protection
@@ -2464,11 +2726,19 @@ class MLTraderProMax(Strategy):
             for position in positions
             if abs(_as_float(position.get("qty"), 0.0)) > 0
         }
-        # Drop per-symbol trailing state as soon as a position is gone, so a
-        # later trade in the same symbol starts from its own entry price.
-        for stale in set(self._high_water) - held:
-            self._high_water.pop(stale, None)
-            self._software_stops.pop(stale, None)
+        # Drop per-symbol state as soon as a position is gone, so a later trade
+        # in the same symbol starts from its own entry price and stop level.
+        stale_symbols = (
+            set(self._high_water)
+            | set(self._software_stops)
+            | set(self._position_opened_at)
+        ) - held
+        for stale in stale_symbols:
+            self._clear_position_state(stale)
+        if stale_symbols:
+            # Persist the purge so a restart cannot restore a hold-time stamp
+            # that belongs to a position which is already closed.
+            self._save_risk_state()
         if not positions:
             return
 
@@ -2480,14 +2750,13 @@ class MLTraderProMax(Strategy):
             if not symbol or abs(qty) <= 0 or entry <= 0 or current <= 0:
                 continue
 
-            high_water = max(
-                self._high_water.get(symbol, entry), current
-            )
+            high_water = max(self._high_water.get(symbol, entry), current)
             self._high_water[symbol] = high_water
 
-            stop_order = None
             try:
-                stop_order = self._find_protective_stop(symbol, strict=True)
+                stop_order = self._find_protective_stop(
+                    symbol, orders=orders, strict=True
+                )
             except Exception as exc:
                 logger.warning(
                     "[%s] skipping stop management for this cycle: %s", symbol, exc
@@ -2551,165 +2820,159 @@ class MLTraderProMax(Strategy):
     # Signal execution
     # ------------------------------------------------------------------
     def _execute_signal(self, data):
-        symbol = data["symbol"]
-        price = data["price"]
-        rsi = data["rsi"]
-        macd_bull = data["macd_bull"]
-        label = data["sentiment_label"]
-
-        # No order may leave the bot after the daily circuit breaker fired.
+        """Route one analysed symbol to an entry or an exit decision."""
+        symbol = data.get("symbol", "?")
         if self._trading_halted():
             logger.info(
                 "[%s] signal ignored: daily circuit breaker has halted trading",
                 symbol,
             )
             return
-
-        # Belt-and-braces guard: even if this method is called directly, no
-        # order may leave the bot during the opening volatility window.
         if in_opening_blackout(self._market_now()):
             logger.info(
                 "[%s] signal ignored: opening volatility filter is active", symbol
             )
             return
 
-        # --- BUY ---------------------------------------------------------
-        if rsi < RSI_OVERSOLD and macd_bull and label == "positive":
-            # If account/position data could not be read the daily loss guard
-            # cannot see the real exposure, so no new risk may be added.
-            if getattr(self, "_risk_data_stale", False):
-                logger.warning(
-                    "[%s] entry skipped: account data is stale, so the daily "
-                    "loss limit cannot be verified",
-                    symbol,
-                )
-                return
-            if self._count_exposure_slots() >= MAX_CONCURRENT_POSITIONS:
-                logger.info(
-                    "[%s] entry skipped: maximum %d concurrent positions reached",
-                    symbol,
-                    MAX_CONCURRENT_POSITIONS,
-                )
-                return
-            if self._has_pending_buy(symbol):
-                return
-            try:
-                pos = _retry(self.get_position, symbol, description="get_position")
-            except Exception as exc:
-                logger.error("[%s] get_position failed: %s", symbol, exc)
-                return
-            if pos is not None and getattr(pos, "quantity", 0):
-                return  # already holding
+        if _is_entry_signal(data):
+            self._try_enter(data)
+        elif data.get("rsi", 0.0) > RSI_OVERBOUGHT:
+            self._try_exit(data)
 
-            try:
-                cash = _retry(self.get_cash, description="get_cash")
-            except Exception as exc:
-                logger.error("[%s] get_cash failed: %s", symbol, exc)
-                return
-            try:
-                equity = _retry(
-                    self.get_portfolio_value, description="get_portfolio_value"
-                )
-            except Exception as exc:
-                logger.warning(
-                    "[%s] get_portfolio_value failed (%s); using cash for risk sizing",
-                    symbol,
-                    exc,
-                )
-                equity = cash
+    def _try_enter(self, data):
+        """Open a protected position when every confirmation aligns."""
+        symbol = data["symbol"]
+        price = data["price"]
+        label = data.get("sentiment_label", "neutral")
 
-            # Compute SL/TP before sizing: the distance to the stop determines
-            # how many shares the risk budget allows.
-            try:
-                stop_loss_price, take_profit_price = bracket_prices(price)
-            except ValueError as exc:
-                logger.error("[%s] refusing entry, invalid SL/TP: %s", symbol, exc)
-                self.telegram_send_message(
-                    format_rejected_message(symbol, "buy", exc)
-                )
-                return
-
-            quantity = position_size(
-                price, cash, equity, stop_loss_price
+        if getattr(self, "_risk_data_stale", False):
+            logger.warning(
+                "[%s] entry skipped: account data is stale, so the daily loss "
+                "limit cannot be verified",
+                symbol,
             )
-            if quantity <= 0:
+            return
+        if self._count_exposure_slots() >= MAX_CONCURRENT_POSITIONS:
+            logger.info(
+                "[%s] entry skipped: maximum %d concurrent positions reached",
+                symbol,
+                MAX_CONCURRENT_POSITIONS,
+            )
+            return
+        if self._has_pending_buy(symbol):
+            return
+        try:
+            position = _retry(self.get_position, symbol, description="get_position")
+        except Exception as exc:
+            logger.error("[%s] get_position failed: %s", symbol, exc)
+            return
+        if position is not None and getattr(position, "quantity", 0):
+            return
+
+        try:
+            cash = _retry(self.get_cash, description="get_cash")
+        except Exception as exc:
+            logger.error("[%s] get_cash failed: %s", symbol, exc)
+            return
+        try:
+            equity = _retry(
+                self.get_portfolio_value, description="get_portfolio_value"
+            )
+        except Exception as exc:
+            logger.warning(
+                "[%s] get_portfolio_value failed (%s); using cash for risk sizing",
+                symbol,
+                exc,
+            )
+            equity = cash
+
+        # The stop distance determines how many shares the risk budget allows.
+        try:
+            stop_loss, take_profit = bracket_prices(price)
+        except ValueError as exc:
+            logger.error("[%s] refusing entry, invalid SL/TP: %s", symbol, exc)
+            self.telegram_send_message(format_rejected_message(symbol, "buy", exc))
+            return
+
+        quantity = position_size(price, cash, equity, stop_loss)
+        if quantity <= 0:
+            logger.info(
+                "[%s] entry skipped: risk sizing produced 0 shares "
+                "(price=%.2f, cash=%.2f, equity=%.2f, SL=%.2f)",
+                symbol,
+                price,
+                cash,
+                equity,
+                stop_loss,
+            )
+            return
+
+        try:
+            order = self._create_entry_order(
+                symbol, quantity, price, stop_loss, take_profit
+            )
+            self._submit_with_retry(order)
+            self._mark_position_opened(symbol)
+            self._log.info(
+                "BUY %s qty=%d @ %.2f (rsi=%.1f, sentiment=%s %.2f, "
+                "trend=SMA/EMA bull, SL=%.2f, TP=%.2f)",
+                symbol,
+                quantity,
+                price,
+                data.get("rsi", 0.0),
+                label,
+                data.get("sentiment_score", 0.0),
+                stop_loss,
+                take_profit,
+            )
+            self.telegram_send_message(
+                format_buy_message(symbol, price, stop_loss, take_profit, label)
+            )
+        except Exception as exc:
+            self._position_opened_at.pop(symbol, None)
+            logger.error("[%s] BUY order failed: %s", symbol, exc)
+            self.telegram_send_message(format_rejected_message(symbol, "buy", exc))
+
+    def _try_exit(self, data):
+        """Close an overbought position once the minimum hold time has passed."""
+        symbol = data["symbol"]
+        price = data["price"]
+        now = self._market_now()
+
+        if not self._hold_time_elapsed(symbol, now):
+            logger.info(
+                "[%s] signal exit deferred: minimum hold time is %d minutes",
+                symbol,
+                MIN_HOLD_MINUTES,
+            )
+            return
+
+        try:
+            position = _retry(self.get_position, symbol, description="get_position")
+        except Exception as exc:
+            logger.error("[%s] get_position failed: %s", symbol, exc)
+            return
+        if position is None or not getattr(position, "quantity", 0):
+            return
+
+        try:
+            closed = self._close_position_market(
+                symbol,
+                getattr(position, "quantity", 0),
+                "السعر وصل لمستويات مرتفعة",
+                price,
+            )
+            if closed:
                 self._log.info(
-                    "[%s] entry skipped: risk sizing produced 0 shares "
-                    "(price=%.2f, cash=%.2f, equity=%.2f, SL=%.2f)",
+                    "SELL %s qty=%s @ %.2f (rsi=%.1f)",
                     symbol,
+                    position.quantity,
                     price,
-                    cash,
-                    equity,
-                    stop_loss_price,
+                    data.get("rsi", 0.0),
                 )
-                return
-
-            try:
-                order = self._create_entry_order(
-                    symbol,
-                    quantity,
-                    price,
-                    stop_loss_price,
-                    take_profit_price,
-                )
-                self._submit_with_retry(order)
-                self._log.info(
-                    "BUY %s qty=%d @ %.2f (rsi=%.1f, sentiment=%s, SL=%.2f, TP=%.2f)",
-                    symbol,
-                    quantity,
-                    price,
-                    rsi,
-                    label,
-                    stop_loss_price,
-                    take_profit_price,
-                )
-                self.telegram_send_message(
-                    format_buy_message(
-                        symbol,
-                        price,
-                        stop_loss_price,
-                        take_profit_price,
-                        label,
-                    )
-                )
-            except Exception as exc:
-                logger.error("[%s] BUY order failed: %s", symbol, exc)
-                self.telegram_send_message(
-                    format_rejected_message(symbol, "buy", exc)
-                )
-
-        # --- SELL --------------------------------------------------------
-        elif rsi > RSI_OVERBOUGHT:
-            try:
-                pos = _retry(self.get_position, symbol, description="get_position")
-            except Exception as exc:
-                logger.error("[%s] get_position failed: %s", symbol, exc)
-                return
-            if pos is None or not getattr(pos, "quantity", 0):
-                return
-
-            try:
-                # Cancel the bracket's stop/take-profit legs first: they hold
-                # the shares and would make a separate sell order fail.
-                closed = self._close_position_market(
-                    symbol,
-                    getattr(pos, "quantity", 0),
-                    "السعر وصل لمستويات مرتفعة",
-                    price,
-                )
-                if closed:
-                    self._log.info(
-                        "SELL %s qty=%s @ %.2f (rsi=%.1f)",
-                        symbol,
-                        pos.quantity,
-                        price,
-                        rsi,
-                    )
-            except Exception as exc:
-                logger.error("[%s] SELL order failed: %s", symbol, exc)
-                self.telegram_send_message(
-                    format_rejected_message(symbol, "sell", exc)
-                )
+        except Exception as exc:
+            logger.error("[%s] SELL order failed: %s", symbol, exc)
+            self.telegram_send_message(format_rejected_message(symbol, "sell", exc))
 
     # ------------------------------------------------------------------
     # Main loop
@@ -2741,6 +3004,10 @@ class MLTraderProMax(Strategy):
         # First iteration of a new trading day: announce the session once.
         self._send_session_start_message(now)
 
+        # One broker snapshot per cycle: sync stop/TP ids, purge closed orders
+        # and reuse the list for trailing-stop management (no duplicate calls).
+        live_orders = self._refresh_order_state()
+
         # Risk management runs before anything else and is never skipped by
         # the opening blackout: protecting open positions is always allowed.
         try:
@@ -2755,7 +3022,7 @@ class MLTraderProMax(Strategy):
         # do not let trailing-stop management race with those market sells.
         if not halted:
             try:
-                self._manage_open_positions(now)
+                self._manage_open_positions(now, live_orders)
             except Exception as exc:
                 logger.error(
                     "Position protection (trailing stop) failed: %s",
@@ -2813,14 +3080,20 @@ class MLTraderProMax(Strategy):
         """lumibot lifecycle hook: confirm the fill and feed the trade ledger."""
         try:
             symbol = _order_symbol(order, position)
-            side = _enum_value(getattr(order, "side", None))
+            side = _order_side(order)
             filled_qty = quantity if quantity is not None else getattr(
                 order, "quantity", None
             )
-            fill_id = getattr(order, "identifier", None) or getattr(
-                order, "id", None
-            )
+            fill_id = _order_id(order)
             self._record_trade_fill(symbol, side, filled_qty, price, fill_id)
+            self._order_tracker.forget(fill_id)
+            self._forget_broker_order(order)
+            if side == "buy":
+                self._mark_position_opened(symbol)
+            elif side == "sell":
+                # The OCO sibling is cancelled by Alpaca; forget both leg ids.
+                self._clear_position_state(symbol)
+                self._save_risk_state()
             self.telegram_send_message(
                 format_fill_message(symbol, side, filled_qty, price)
             )
@@ -2828,10 +3101,35 @@ class MLTraderProMax(Strategy):
             logger.error("on_filled_order failed: %s", exc, exc_info=True)
 
     def on_canceled_order(self, order):
-        """lumibot lifecycle hook: tell the user an order was not completed."""
+        """Handle a broker cancellation without spamming Telegram.
+
+        Alpaca cancels the sibling leg of every bracket (OCO) and lumibot also
+        cancels stale tracked orders. Those are automated bracket replacements,
+        not user/strategy cancellations, and must stay silent. An order the bot
+        cancelled itself is in ``_auto_cancels``; a protective leg is recognised
+        by its type. Everything else (e.g. a user cancelling an entry in the
+        Alpaca dashboard) is a real cancellation and is announced.
+        """
         try:
+            order_id = _order_id(order)
             symbol = _order_symbol(order)
-            side = _enum_value(getattr(order, "side", None))
+            side = _order_side(order)
+            tracked = self._order_tracker.info(order_id)
+            automated = (
+                bool(order_id and self._auto_cancels.pop(order_id, None))
+                or _protective_kind(order) is not None
+                or bool(tracked and tracked.get("kind") in (STOP_LOSS, TAKE_PROFIT))
+            )
+            self._order_tracker.forget(order_id)
+            self._forget_broker_order(order)
+
+            if automated:
+                logger.debug(
+                    "[%s] bracket/automated order %s cancelled; no alert",
+                    symbol,
+                    order_id or "?",
+                )
+                return
             self.telegram_send_message(format_cancelled_message(symbol, side))
         except Exception as exc:
             logger.error("on_canceled_order failed: %s", exc, exc_info=True)
@@ -2946,38 +3244,13 @@ class MLTraderProMax(Strategy):
         if self._ledger_sync_date == today:
             return
 
-        # Prefer Alpaca positions because they include the average entry price
-        # needed for a meaningful P/L when the position is later sold.
-        normalized = []
-        api = getattr(getattr(self, "broker", None), "api", None)
-        if api is not None:
-            try:
-                normalized = _positions_snapshot(api)
-            except Exception as exc:
-                self._log.warning(
-                    "Could not read Alpaca positions for trade ledger: %s", exc
-                )
-
-        if not normalized:
-            try:
-                positions = self.get_positions() or []
-            except Exception as exc:
-                self._log.warning(
-                    "Could not sync positions to trade ledger: %s", exc
-                )
-                return
-            for position in positions:
-                asset = getattr(position, "asset", None)
-                symbol = getattr(asset, "symbol", None) or getattr(
-                    position, "symbol", None
-                )
-                normalized.append(
-                    {
-                        "symbol": symbol,
-                        "qty": getattr(position, "quantity", None),
-                        "avg_entry": getattr(position, "avg_entry_price", None),
-                    }
-                )
+        # ``_position_rows`` prefers Alpaca (average entry price) and falls back
+        # to lumibot's tracked positions, so the ledger is seeded either way.
+        try:
+            normalized = self._position_rows(strict=True)
+        except Exception as exc:
+            self._log.warning("Could not sync positions to trade ledger: %s", exc)
+            return
 
         seeded = ledger.seed_positions(normalized)
         if seeded:
@@ -3066,21 +3339,7 @@ class MLTraderProMax(Strategy):
             self._log.warning("Fallback account lookup failed: %s", exc)
 
         try:
-            for position in self.get_positions() or []:
-                asset = getattr(position, "asset", None)
-                snapshot["positions"].append(
-                    {
-                        "symbol": getattr(asset, "symbol", "?"),
-                        "qty": _as_float(getattr(position, "quantity", None)),
-                        "avg_entry": _as_float(
-                            getattr(position, "avg_entry_price", None)
-                        ),
-                        "current_price": 0.0,
-                        "market_value": 0.0,
-                        "unrealized_pl": 0.0,
-                        "unrealized_plpc": 0.0,
-                    }
-                )
+            snapshot["positions"] = self._position_rows()
         except Exception as exc:
             self._log.warning("Fallback position lookup failed: %s", exc)
 
@@ -3202,7 +3461,7 @@ def main():
         raise SystemExit(2)
 
     if IS_BACKTESTING:
-        from lumibot.backtesting import YahooDataBacktesting # pyright: ignore[reportMissingImports]
+        from lumibot.backtesting import YahooDataBacktesting  # pyright: ignore[reportMissingImports]
 
         start = datetime.fromisoformat(BACKTEST_START)
         end = datetime.fromisoformat(BACKTEST_END)
